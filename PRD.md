@@ -48,9 +48,10 @@ Basé sur l'analyse du Guide.txt, le protocole **SoftAP + UDP raw** est retenu c
 | CAM-01 | Capturer des photos JPEG 360×360 | Utiliser la compression JPEG native de l'OV5640. Framesize personnalisé ou crop depuis HVGA. |
 | CAM-02 | Créer un Access Point Wi-Fi | SSID : `TeslaCam`, pas de mot de passe (réseau local fermé). IP : `192.168.4.1`. |
 | CAM-03 | Envoyer les frames via UDP chunked | Découper chaque JPEG en chunks ≤ 1452 bytes avec header 8 bytes. Port destination : `5000`. |
-| CAM-04 | Cadence cible | ≥ 15 fps en continu. |
+| CAM-04 | Cadence cible | ≥ 15 fps en continu (quand le streaming est actif). |
 | CAM-05 | Miroir horizontal + flip vertical | Image retournée pour montage caméra de recul (configurable). |
 | CAM-06 | Task FreeRTOS dédiée | Le streaming tourne sur un core dédié (core 1) pour ne pas bloquer le système. |
+| CAM-07 | Mode veille par défaut | Au démarrage, la caméra **n'émet pas**. Elle attend une commande `START` de l'Écran via UDP avant de commencer la capture et l'envoi. Sur réception d'une commande `STOP`, elle cesse la capture et repasse en veille (économie d'énergie et réduction de la chauffe). |
 
 ### 4.2 ESP32-S3 Écran (récepteur)
 
@@ -61,11 +62,15 @@ Basé sur l'analyse du Guide.txt, le protocole **SoftAP + UDP raw** est retenu c
 | ECR-03 | Décoder le JPEG | Utiliser la librairie JPEGDEC pour décoder le JPEG en RGB565. |
 | ECR-04 | Afficher sur l'écran ST77916 | Rendu via Arduino_GFX `draw16bitRGBBitmap()`. Pas d'LVGL nécessaire pour l'affichage photo (rendu direct). |
 | ECR-05 | Timeout / écran noir | Si aucune frame complète reçue pendant > 500 ms, afficher un écran noir (ne jamais rester sur une image figée). |
-| ECR-06 | Double buffering frames | Deux buffers JPEG en PSRAM : un en réception, un en décodage, pour éviter les artefacts. |
+| ECR-06 | Triple buffering frames | Trois buffers JPEG en PSRAM (réception / prêt / affichage) avec mutex FreeRTOS, pour éviter les artefacts et la perte de paquets. |
+| ECR-07 | Activation/désactivation par toucher | Un appui sur l'écran tactile envoie une commande `START` à la Camera (UDP). Un second appui envoie `STOP`. L'état bascule à chaque toucher (toggle). Quand le streaming est inactif, l'écran affiche un indicateur visuel (ex: icône caméra barrée ou texte "Appuyez pour activer"). |
+| ECR-08 | Commande UDP de contrôle | Envoie les commandes `START` / `STOP` à la Camera via UDP port `5001` (port de contrôle distinct du port vidéo `5000`). |
 
 ---
 
-## 5. Protocole UDP — Structure des paquets
+## 5. Protocole UDP
+
+### 5.1 Canal vidéo (port 5000) — Camera → Écran
 
 ```
 ┌─────────────────────────────────────────┐
@@ -82,6 +87,21 @@ Basé sur l'analyse du Guide.txt, le protocole **SoftAP + UDP raw** est retenu c
 
 - **MTU Wi-Fi** : 1460 bytes utiles en UDP → 8 header + 1452 payload
 - **Frame JPEG 360×360** estimée : ~12–20 KB → ~9–14 chunks par frame
+
+### 5.2 Canal de contrôle (port 5001) — Écran → Camera
+
+```
+┌─────────────────────────────────────────┐
+│  COMMAND (4 bytes ASCII)                │
+│  "STRT" = démarrer capture + streaming  │
+│  "STOP" = arrêter capture + streaming   │
+└─────────────────────────────────────────┘
+```
+
+- L'Écran envoie la commande à `192.168.4.1:5001`
+- La Camera écoute sur le port `5001` en plus du port vidéo
+- Au démarrage, la Camera est en mode veille (pas de capture)
+- L'Écran réémet `STRT` périodiquement (toutes les 2s) tant que le streaming est actif, pour gérer les reconnexions
 
 ---
 
@@ -159,18 +179,27 @@ lib_deps =
 ## 9. Plan d'implémentation
 
 ### Phase 1 — Communication de base
-- [ ] **Camera** : Remplacer le mode Station + HTTP par un mode SoftAP + UDP sender
-- [ ] **Écran** : Remplacer la démo arc gauge par un récepteur UDP + affichage JPEG
-- [ ] Valider la réception d'une frame JPEG complète (log Serial)
+- [x] **Camera** : Remplacer le mode Station + HTTP par un mode SoftAP + UDP sender
+- [x] **Écran** : Remplacer la démo arc gauge par un récepteur UDP + affichage JPEG
+- [x] Valider la réception d'une frame JPEG complète (log Serial)
 
 ### Phase 2 — Affichage fonctionnel
-- [ ] **Écran** : Décoder les JPEG reçus via JPEGDEC et afficher via `draw16bitRGBBitmap()`
-- [ ] **Écran** : Implémenter le crop/centrage de l'image HVGA vers 360×360
-- [ ] **Écran** : Implémenter le timeout (écran noir après 500 ms sans frame)
+- [x] **Écran** : Décoder les JPEG reçus via JPEGDEC et afficher via `draw16bitRGBBitmap()`
+- [x] **Écran** : Implémenter le crop/centrage de l'image HVGA vers 360×360
+- [x] **Écran** : Implémenter le timeout (écran noir après 500 ms sans frame)
 
 ### Phase 3 — Optimisation
-- [ ] Mesurer et optimiser le FPS et la latence
+- [x] Mesurer et optimiser le FPS et la latence
+- [x] Triple buffer + task UDP dédiée + screen buffer batch → 12.5 fps
 - [ ] Ajuster la qualité JPEG et la résolution pour le meilleur compromis
+
+### Phase 4 — Activation par toucher
+- [ ] **Écran** : Détecter le toucher sur l'écran tactile (driver tactile du JC3636W518C)
+- [ ] **Écran** : Implémenter le toggle START/STOP avec envoi de commande UDP sur port 5001
+- [ ] **Écran** : Afficher un écran d'attente quand le streaming est inactif ("Appuyez pour activer")
+- [ ] **Camera** : Écouter le port 5001 pour les commandes de contrôle
+- [ ] **Camera** : Ne capturer et émettre que lorsque la commande START a été reçue
+- [ ] **Camera** : Couper la capture (et réduire la consommation) sur commande STOP
 
 ---
 
@@ -181,7 +210,8 @@ lib_deps =
 | Perte de paquets UDP | Artefacts visuels, frames incomplètes | Drop des frames incomplètes, toujours afficher la dernière frame valide |
 | OV5640 ne fait pas 360×360 natif | Image non carrée | Capturer en HVGA/VGA puis crop côté récepteur |
 | Interférences Wi-Fi dans le véhicule | Baisses de FPS | Canal Wi-Fi fixe (1 ou 11), puissance TX maximale |
-| Dépassement mémoire PSRAM | Crash | Limiter à 2 buffers, surveiller `heap_caps_get_free_size()` |
+| Dépassement mémoire PSRAM | Crash | Limiter à 3 buffers, surveiller `heap_caps_get_free_size()` |
+| Chauffe du module Camera | Dégradation | Mode veille par défaut ; capture uniquement sur demande via toucher écran |
 
 ---
 
@@ -192,3 +222,6 @@ lib_deps =
 - [ ] L'écran passe au noir si la caméra est déconnectée (timeout 500 ms)
 - [ ] Le système fonctionne sans routeur Wi-Fi externe (SoftAP autonome)
 - [ ] Pas de fuite mémoire après 1h de fonctionnement continu
+- [ ] Un appui sur l'écran démarre le streaming, un second l'arrête
+- [ ] La Camera ne consomme pas de ressources CPU/Wi-Fi en mode veille
+- [ ] L'écran affiche un état visuel clair (actif vs inactif)
