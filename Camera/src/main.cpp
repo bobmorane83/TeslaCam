@@ -193,6 +193,16 @@ void sendFrame(camera_fb_t *fb) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────
+//  Sensor sleep / wake  (OV5640 software standby via register 0x3008 bit 6)
+// ─────────────────────────────────────────────────────────────────────────────────
+static void setSensorSleep(bool sleep) {
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s) return;
+    s->set_reg(s, 0x3008, 0x40, sleep ? 0x40 : 0x00);
+    Serial.printf("[CAM] Sensor %s\n", sleep ? "sleeping" : "awake");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────
 //  Streaming task — handles both control commands and frame streaming (core 1)
 //  Core 0 is kept entirely free for WiFi driver processing.
 // ─────────────────────────────────────────────────────────────────────────────────
@@ -229,6 +239,7 @@ void streamTask(void *pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(2000));
     Serial.println("[STREAM] Ready — waiting for STRT command");
     lastCtrlTime = millis();  // prevent immediate heartbeat timeout
+    setSensorSleep(true);     // sensor off by default until STRT
 
     unsigned long frames = 0;
     unsigned long t0 = millis();
@@ -265,6 +276,7 @@ void streamTask(void *pvParameters) {
             if (wasStreaming) {
                 Serial.println("[STREAM] Paused — STOP received");
                 wasStreaming = false;
+                setSensorSleep(true);
             }
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
@@ -283,6 +295,9 @@ void streamTask(void *pvParameters) {
                 vTaskDelay(pdMS_TO_TICKS(200));
                 continue;
             }
+            // Wake sensor and let it stabilise before capturing
+            setSensorSleep(false);
+            vTaskDelay(pdMS_TO_TICKS(200));
             // Drain stale ctrl commands
             if (ctrl_sock >= 0) {
                 char drain[8];
