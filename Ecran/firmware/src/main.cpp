@@ -2,9 +2,13 @@
  * TeslaCam — ESP32-S3 Display (JC3636W518C, ST77916, 360×360 round)
  * Wi-Fi Station + UDP receiver — decodes JPEG and displays on screen.
  *
- * Connects to the Camera SoftAP "TeslaCam" and receives JPEG frames
- * via UDP chunks on port 5000. Decodes with JPEGDEC and displays via
- * Arduino_GFX with center-crop from VGA (640×480) to 360×360.
+ * Architecture:
+ *   Core 0: UDP recv task (high priority, blocking recv, never misses packets)
+ *   Core 1: Main loop — JPEG decode to screen buffer, then batch draw
+ *
+ * Triple-buffered JPEG reception prevents contention between recv and display.
+ * Screen buffer in PSRAM allows one big QSPI transfer per frame instead of
+ * thousands of tiny per-line draws.
  */
 
 #include <Arduino.h>
@@ -13,6 +17,7 @@
 #include <JPEGDEC.h>
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include <freertos/semphr.h>
 
 /* ── Display hardware ────────────────────────────────────────────────── */
 #define SCREEN_W 360
@@ -35,7 +40,6 @@ static const IPAddress STATIC_IP(192, 168, 4, 2);
 static const IPAddress GATEWAY(192, 168, 4, 1);
 static const IPAddress SUBNET(255, 255, 255, 0);
 
-
 /* ── UDP ─────────────────────────────────────────────────────────────── */
 #define UDP_PORT       5000
 #define HEADER_SIZE    8
@@ -44,69 +48,66 @@ static const IPAddress SUBNET(255, 255, 255, 0);
 
 static int udp_sock = -1;
 
-/* ── Double-buffered frame reception ─────────────────────────────────── */
-static uint8_t *frameBuf[2];       // Two JPEG buffers in PSRAM
-static uint8_t  recvIdx    = 0;    // Buffer being filled
-static uint8_t  dispIdx    = 1;    // Buffer ready for display
-static size_t   dispLen    = 0;    // Size of last complete frame
-static volatile bool frameReady = false;
+/* ── Triple-buffered JPEG reception ──────────────────────────────────── */
+static uint8_t *jpegBuf[3];               // 3 JPEG buffers in PSRAM
+static SemaphoreHandle_t tbMutex;
+static int tbWrite   = 0;                 // Recv task writes here
+static int tbReady   = -1;                // Last completed frame (-1 = none)
+static int tbDisplay = -1;                // Display task reading (-1 = none)
+static size_t tbReadyLen = 0;
 
+// Recv-task-only state (no mutex needed)
 static uint16_t currentFrameId  = 0;
 static uint16_t expectedChunks  = 0;
 static uint16_t receivedChunks  = 0;
 static size_t   recvFrameLen    = 0;
 
+/* ── Screen buffer for batch display ─────────────────────────────────── */
+static uint16_t *screenBuf;               // SCREEN_W × SCREEN_H in PSRAM
+
 /* ── Timeout ─────────────────────────────────────────────────────────── */
-static unsigned long lastFrameTime = 0;
+static volatile unsigned long lastFrameTime = 0;
 #define FRAME_TIMEOUT_MS 500
 static bool screenBlank = true;
 
-/* ── Crop parameters (VGA 640×480 → 360×360 center crop) ────────────── */
-static int cropX = 0;   // Computed after first JPEG decode
-static int cropY = 0;
+/* ── Crop / center parameters ────────────────────────────────────────── */
+static int cropX    = 0;   // Source image crop offset X
+static int cropY    = 0;   // Source image crop offset Y
+static int screenOX = 0;   // Screen draw offset X (centering)
+static int screenOY = 0;   // Screen draw offset Y (centering)
+static int drawW    = SCREEN_W;  // Actual drawn width
+static int drawH    = SCREEN_H;  // Actual drawn height
 
-/* ── JPEGDEC draw callback ───────────────────────────────────────────── */
+/* ── JPEGDEC draw callback — writes to screenBuf (fast memcpy) ───── */
 static int jpegDrawCallback(JPEGDRAW *pDraw) {
-    // pDraw->x, pDraw->y: position in the source image
-    // pDraw->iWidth, pDraw->iHeight: block size
-    // pDraw->pPixels: RGB565 pixel data
-
-    // Compute intersection with crop region
     int srcX1 = pDraw->x;
     int srcY1 = pDraw->y;
     int srcX2 = pDraw->x + pDraw->iWidth;
     int srcY2 = pDraw->y + pDraw->iHeight;
 
-    int cX1 = cropX;
-    int cY1 = cropY;
-    int cX2 = cropX + SCREEN_W;
-    int cY2 = cropY + SCREEN_H;
+    int cX2 = cropX + drawW;
+    int cY2 = cropY + drawH;
 
-    // Clip to crop region
-    int ix1 = max(srcX1, cX1);
-    int iy1 = max(srcY1, cY1);
+    int ix1 = max(srcX1, cropX);
+    int iy1 = max(srcY1, cropY);
     int ix2 = min(srcX2, cX2);
     int iy2 = min(srcY2, cY2);
 
-    if (ix1 >= ix2 || iy1 >= iy2) return 1; // No overlap
+    if (ix1 >= ix2 || iy1 >= iy2) return 1;
 
-    // Screen coordinates
-    int screenX = ix1 - cropX;
-    int screenY = iy1 - cropY;
-    int drawW   = ix2 - ix1;
-    int drawH   = iy2 - iy1;
-
-    // Offset into the MCU block data
+    int sx = ix1 - cropX + screenOX;
+    int sy = iy1 - cropY + screenOY;
+    int w  = ix2 - ix1;
+    int h  = iy2 - iy1;
     int offX = ix1 - srcX1;
     int offY = iy1 - srcY1;
 
-    // Draw line by line from the block
-    for (int row = 0; row < drawH; row++) {
+    for (int row = 0; row < h; row++) {
         uint16_t *src = pDraw->pPixels + (offY + row) * pDraw->iWidth + offX;
-        gfx->draw16bitRGBBitmap(screenX, screenY + row, src, drawW, 1);
+        uint16_t *dst = screenBuf + (sy + row) * SCREEN_W + sx;
+        memcpy(dst, src, w * 2);
     }
-
-    return 1; // Continue decoding
+    return 1;
 }
 
 /* ── Connect to Camera SoftAP ────────────────────────────────────────── */
@@ -128,7 +129,7 @@ void connectToCamera() {
     Serial.printf("\n[WIFI] Connected – IP: %s\n", WiFi.localIP().toString().c_str());
 }
 
-/* ── Process one incoming UDP packet ─────────────────────────────────── */
+/* ── Process one incoming UDP packet (called from recv task only) ───── */
 void processPacket(uint8_t *data, size_t len) {
     if (len < HEADER_SIZE) return;
 
@@ -138,7 +139,6 @@ void processPacket(uint8_t *data, size_t len) {
     memcpy(&totalChunks, data + 4, 2);
     memcpy(&chunkSize,   data + 6, 2);
 
-    // Validate chunk size
     if (chunkSize > CHUNK_PAYLOAD || chunkSize + HEADER_SIZE > len) return;
 
     // New frame detected — reset receiver state
@@ -149,53 +149,105 @@ void processPacket(uint8_t *data, size_t len) {
         recvFrameLen   = 0;
     }
 
-    // Copy chunk payload into receive buffer
     uint32_t offset = (uint32_t)chunkId * CHUNK_PAYLOAD;
-    if (offset + chunkSize > MAX_FRAME_SIZE) return;  // Safety check
+    if (offset + chunkSize > MAX_FRAME_SIZE) return;
 
-    memcpy(frameBuf[recvIdx] + offset, data + HEADER_SIZE, chunkSize);
+    memcpy(jpegBuf[tbWrite] + offset, data + HEADER_SIZE, chunkSize);
 
-    // Track the total size (last chunk determines actual end)
     size_t endPos = offset + chunkSize;
     if (endPos > recvFrameLen) recvFrameLen = endPos;
-
     receivedChunks++;
 
-    // Frame complete?
+    // Frame complete — publish to triple buffer
     if (receivedChunks == expectedChunks) {
-        // Swap buffers
-        dispLen = recvFrameLen;
-        uint8_t tmp = recvIdx;
-        recvIdx = dispIdx;
-        dispIdx = tmp;
-        frameReady = true;
-        lastFrameTime = millis();
+        xSemaphoreTake(tbMutex, portMAX_DELAY);
+        tbReady    = tbWrite;
+        tbReadyLen = recvFrameLen;
+        // Pick next write slot (not ready, not display)
+        for (int i = 0; i < 3; i++) {
+            if (i != tbReady && i != tbDisplay) { tbWrite = i; break; }
+        }
+        xSemaphoreGive(tbMutex);
 
+        lastFrameTime = millis();
         receivedChunks = 0;
-        recvFrameLen = 0;
+        recvFrameLen   = 0;
     }
 }
 
-/* ── Decode and display a complete JPEG frame ────────────────────────── */
-void decodeAndDisplay() {
+/* ── UDP receive task — runs on core 0, blocking recv ────────────────── */
+void udpRecvTask(void *pvParameters) {
+    uint8_t buf[HEADER_SIZE + CHUNK_PAYLOAD];
+    while (true) {
+        int len = recvfrom(udp_sock, buf, sizeof(buf), 0, NULL, NULL); // blocking
+        if (len > 0) processPacket(buf, len);
+    }
+}
+
+/* ── Grab latest frame for display (returns buf index or -1) ─────────── */
+int grabReadyFrame(size_t *outLen) {
+    xSemaphoreTake(tbMutex, portMAX_DELAY);
+    if (tbReady < 0) {
+        xSemaphoreGive(tbMutex);
+        return -1;
+    }
+    tbDisplay = tbReady;
+    tbReady   = -1;
+    *outLen   = tbReadyLen;
+    xSemaphoreGive(tbMutex);
+    return tbDisplay;
+}
+
+/* ── Release display buffer ──────────────────────────────────────────── */
+void releaseDisplayBuffer() {
+    xSemaphoreTake(tbMutex, portMAX_DELAY);
+    tbDisplay = -1;
+    xSemaphoreGive(tbMutex);
+}
+
+/* ── Decode JPEG into screenBuf, then batch-draw to display ──────────── */
+void decodeAndDisplay(int bufIdx, size_t len) {
     static JPEGDEC jpeg;
 
-    if (jpeg.openRAM(frameBuf[dispIdx], dispLen, jpegDrawCallback)) {
-        int imgW = jpeg.getWidth();
-        int imgH = jpeg.getHeight();
-
-        // Compute center crop offsets
-        cropX = max(0, (imgW - SCREEN_W) / 2);
-        cropY = max(0, (imgH - SCREEN_H) / 2);
-
-        jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
-        jpeg.decode(0, 0, 0); // Full decode, no scaling
-        jpeg.close();
-
-        if (screenBlank) screenBlank = false;
-    } else {
+    if (!jpeg.openRAM(jpegBuf[bufIdx], len, jpegDrawCallback)) {
         Serial.println("[JPEG] Decode failed");
+        releaseDisplayBuffer();
+        return;
     }
+
+    int imgW = jpeg.getWidth();
+    int imgH = jpeg.getHeight();
+
+    // Compute crop + centering
+    if (imgW >= SCREEN_W) {
+        cropX    = (imgW - SCREEN_W) / 2;
+        screenOX = 0;
+        drawW    = SCREEN_W;
+    } else {
+        cropX    = 0;
+        screenOX = (SCREEN_W - imgW) / 2;
+        drawW    = imgW;
+    }
+    if (imgH >= SCREEN_H) {
+        cropY    = (imgH - SCREEN_H) / 2;
+        screenOY = 0;
+        drawH    = SCREEN_H;
+    } else {
+        cropY    = 0;
+        screenOY = (SCREEN_H - imgH) / 2;
+        drawH    = imgH;
+    }
+
+    jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+    jpeg.decode(0, 0, 0);
+    jpeg.close();
+
+    releaseDisplayBuffer();
+
+    // One batch draw — the entire 360×360 screen in one QSPI transfer
+    gfx->draw16bitRGBBitmap(0, 0, screenBuf, SCREEN_W, SCREEN_H);
+
+    if (screenBlank) screenBlank = false;
 }
 
 /* ── Setup ───────────────────────────────────────────────────────────── */
@@ -204,14 +256,24 @@ void setup() {
     delay(500);
     Serial.println("\n=== TeslaCam – Display (Station + UDP) ===");
 
-    // Allocate double buffers in PSRAM
-    frameBuf[0] = (uint8_t *)heap_caps_malloc(MAX_FRAME_SIZE, MALLOC_CAP_SPIRAM);
-    frameBuf[1] = (uint8_t *)heap_caps_malloc(MAX_FRAME_SIZE, MALLOC_CAP_SPIRAM);
-    if (!frameBuf[0] || !frameBuf[1]) {
-        Serial.println("[FATAL] PSRAM alloc failed");
+    // Allocate triple JPEG buffers in PSRAM
+    for (int i = 0; i < 3; i++) {
+        jpegBuf[i] = (uint8_t *)heap_caps_malloc(MAX_FRAME_SIZE, MALLOC_CAP_SPIRAM);
+        if (!jpegBuf[i]) {
+            Serial.printf("[FATAL] PSRAM alloc failed for jpegBuf[%d]\n", i);
+            while (true) delay(1000);
+        }
+    }
+    // Screen buffer: 360×360 × 2 bytes = 259,200 bytes in PSRAM
+    screenBuf = (uint16_t *)heap_caps_malloc(SCREEN_W * SCREEN_H * 2, MALLOC_CAP_SPIRAM);
+    if (!screenBuf) {
+        Serial.println("[FATAL] Screen buffer alloc failed");
         while (true) delay(1000);
     }
-    Serial.println("[MEM] Frame buffers allocated (2 × 65 KB PSRAM)");
+    memset(screenBuf, 0, SCREEN_W * SCREEN_H * 2);
+    Serial.println("[MEM] 3×65KB JPEG + 259KB screen buffer allocated");
+
+    tbMutex = xSemaphoreCreateMutex();
 
     // Display init
     if (!gfx->begin()) {
@@ -227,7 +289,7 @@ void setup() {
     connectToCamera();
     WiFi.setSleep(false);
 
-    // Create raw lwip UDP socket
+    // Create raw lwip UDP socket (blocking mode for recv task)
     udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (udp_sock < 0) {
         Serial.println("[FATAL] UDP socket creation failed");
@@ -244,37 +306,39 @@ void setup() {
         while (true) delay(1000);
     }
 
-    // Set receive timeout to avoid blocking forever
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 10000;  // 10ms timeout
-    setsockopt(udp_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
     // Increase receive buffer
     int rcvbuf = 65536;
     setsockopt(udp_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
-    Serial.printf("[UDP] Listening on port %d\n", UDP_PORT);
+    Serial.printf("[UDP] Listening on port %d (blocking)\n", UDP_PORT);
+
+    // Launch UDP recv task on core 0, high priority
+    xTaskCreatePinnedToCore(udpRecvTask, "udpRecv", 4096, NULL, 2, NULL, 0);
+    Serial.println("[RECV] UDP recv task started on core 0");
 
     lastFrameTime = millis();
 }
 
-/* ── Loop ────────────────────────────────────────────────────────────── */
+/* ── Loop (core 1) — decode + display ────────────────────────────────── */
+static unsigned long dispFrames = 0;
+static unsigned long dispT0 = 0;
+
 void loop() {
-    // Receive pending UDP packets via raw lwip socket
-    uint8_t buf[HEADER_SIZE + CHUNK_PAYLOAD];
-    int maxPackets = 50;
+    size_t len;
+    int idx = grabReadyFrame(&len);
 
-    while (maxPackets-- > 0) {
-        int len = recvfrom(udp_sock, buf, sizeof(buf), 0, NULL, NULL);
-        if (len <= 0) break;  // No more packets or timeout
-        processPacket(buf, len);
-    }
+    if (idx >= 0) {
+        decodeAndDisplay(idx, len);
 
-    // Display frame if ready
-    if (frameReady) {
-        frameReady = false;
-        decodeAndDisplay();
+        dispFrames++;
+        if (dispFrames == 1) dispT0 = millis();
+        if (dispFrames % 60 == 0) {
+            float fps = dispFrames * 1000.0f / (millis() - dispT0);
+            Serial.printf("[DISPLAY] %lu frames, %.1f fps\n", dispFrames, fps);
+        }
+    } else {
+        // No frame ready — yield briefly to avoid busy-spin
+        taskYIELD();
     }
 
     // Timeout: black screen if no frame for 500ms
@@ -283,6 +347,4 @@ void loop() {
         screenBlank = true;
         Serial.println("[TIMEOUT] No frame – screen blanked");
     }
-
-    delay(1);  // Yield to FreeRTOS scheduler / WDT
 }

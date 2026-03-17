@@ -75,11 +75,11 @@ bool initCamera() {
     cfg.grab_mode    = CAMERA_GRAB_LATEST;
 
     if (psramFound()) {
-        cfg.frame_size   = FRAMESIZE_VGA;    // 640×480
-        cfg.jpeg_quality = 10;
+        cfg.frame_size   = FRAMESIZE_HVGA;   // 480×320 – smaller JPEG, lower latency
+        cfg.jpeg_quality = 12;
         cfg.fb_count     = 2;
         cfg.fb_location  = CAMERA_FB_IN_PSRAM;
-        Serial.println("[CAM] PSRAM – VGA, 2 buffers");
+        Serial.println("[CAM] PSRAM \u2013 HVGA, 2 buffers");
     } else {
         cfg.frame_size   = FRAMESIZE_QVGA;
         cfg.jpeg_quality = 12;
@@ -166,11 +166,8 @@ void sendFrame(camera_fb_t *fb) {
         int ret = sendto(udp_sock, packet, HEADER_SIZE + size, 0,
                          (struct sockaddr *)&dest_addr, sizeof(dest_addr));
         if (ret < 0) {
-            // Back off if send buffer is full
-            vTaskDelay(pdMS_TO_TICKS(5));
-            // Retry once
-            sendto(udp_sock, packet, HEADER_SIZE + size, 0,
-                   (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+            // Skip chunk on failure — don't wait, minimize latency
+            continue;
         }
     }
     frame_id++;
@@ -212,11 +209,11 @@ void streamTask(void *pvParameters) {
         esp_camera_fb_return(fb);
 
         frames++;
-        if (frames % 30 == 0) {
+        if (frames % 60 == 0) {
             float fps = frames * 1000.0f / (millis() - t0);
             Serial.printf("[STREAM] %lu frames, %.1f fps\n", frames, fps);
         }
-        vTaskDelay(pdMS_TO_TICKS(1));   // yield
+        taskYIELD();   // minimal yield, no vTaskDelay
     }
 }
 
