@@ -194,9 +194,9 @@ lib_deps =
 - [ ] Ajuster la qualité JPEG et la résolution pour le meilleur compromis
 
 ### Phase 4 — Activation par toucher
-- [ ] **Écran** : Détecter le toucher sur l'écran tactile (driver tactile du JC3636W518C)
-- [ ] **Écran** : Implémenter le toggle START/STOP avec envoi de commande UDP sur port 5001
-- [ ] **Écran** : Afficher un écran d'attente quand le streaming est inactif ("Appuyez pour activer")
+- [x] **Écran** : Détecter le toucher sur l'écran tactile (CST816S, I2C addr 0x15, SDA=7, SCL=8)
+- [x] **Écran** : Implémenter le toggle START/STOP avec envoi de commande UDP sur port 5001
+- [x] **Écran** : Afficher un écran d'attente quand le streaming est inactif ("Appuyez pour activer")
 - [ ] **Camera** : Écouter le port 5001 pour les commandes de contrôle
 - [ ] **Camera** : Ne capturer et émettre que lorsque la commande START a été reçue
 - [ ] **Camera** : Couper la capture (et réduire la consommation) sur commande STOP
