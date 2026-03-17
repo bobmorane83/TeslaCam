@@ -86,8 +86,9 @@ static uint16_t *screenBuf;
 
 /* ── Timeout ─────────────────────────────────────────────────────────── */
 static volatile unsigned long lastFrameTime = 0;
-#define FRAME_TIMEOUT_MS 500
+#define FRAME_TIMEOUT_MS 2000   // 2s — allows Camera 2s warm-up after STRT
 static bool screenBlank = true;
+static bool firstFrameReceived = false;  // True after first frame since last STRT
 
 /* ── Crop / center parameters ────────────────────────────────────────── */
 static int cropX    = 0;
@@ -302,6 +303,7 @@ void decodeAndDisplay(int bufIdx, size_t len) {
 
     if (screenBlank) screenBlank = false;
     idleScreenDrawn = false;
+    firstFrameReceived = true;
 }
 
 /* ── Setup ───────────────────────────────────────────────────────────── */
@@ -407,10 +409,13 @@ void loop() {
         if (streamActive) {
             sendCtrlCommand("STRT");
             lastCtrlSendMs = now;
+            lastFrameTime = now;      // Reset timeout baseline on activation
+            firstFrameReceived = false;
             Serial.println("[TOUCH] Activated → STRT sent");
         } else {
             sendCtrlCommand("STOP");
             lastCtrlSendMs = now;
+            firstFrameReceived = false;
             Serial.println("[TOUCH] Deactivated → STOP sent");
             // Draw idle screen after short delay to let last frame clear
             drawIdleScreen();
@@ -442,8 +447,8 @@ void loop() {
             taskYIELD();
         }
 
-        // Timeout: show idle if no frame for 500ms while active
-        if (!screenBlank && !idleScreenDrawn &&
+        // Timeout: show idle only after first frame has arrived and then gone silent
+        if (firstFrameReceived && !idleScreenDrawn &&
             (now - lastFrameTime > FRAME_TIMEOUT_MS)) {
             drawIdleScreen();
             Serial.println("[TIMEOUT] No frame – idle screen");
