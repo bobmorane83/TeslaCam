@@ -1,11 +1,29 @@
+/*
+ * TeslaCam — ESP32-S3 Camera (OV5640)
+ * SoftAP + UDP raw streaming to ESP32-S3 Display
+ *
+ * Captures JPEG frames at VGA (640×480) and sends them
+ * via raw lwip UDP to the broadcast address 192.168.4.255:5000.
+ */
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include "esp_camera.h"
-#include "esp_http_server.h"
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
 
-// ── WiFi ────────────────────────────────────────────────────────────────────────
-static const char *WIFI_SSID = "nans6";
-static const char *WIFI_PASS = "Devisubox";
+// ── WiFi SoftAP ─────────────────────────────────────────────────────────────────
+static const char *AP_SSID = "TeslaCam";
+static const IPAddress AP_IP(192, 168, 4, 1);
+static const IPAddress AP_GW(192, 168, 4, 1);
+static const IPAddress AP_MASK(255, 255, 255, 0);
+
+// ── Receiver ────────────────────────────────────────────────────────────────────
+static const uint16_t  RECEIVER_PORT = 5000;
+
+// ── UDP chunking ────────────────────────────────────────────────────────────────
+#define CHUNK_PAYLOAD 1400          // Conservative: well under MTU
+#define HEADER_SIZE   8
 
 // ── OV5640 pin mapping (ESP32-S3 WROOM / Freenove) ─────────────────────────────
 #define PWDN_GPIO   -1
@@ -25,11 +43,9 @@ static const char *WIFI_PASS = "Devisubox";
 #define HREF_GPIO    7
 #define PCLK_GPIO   13
 
-#define STREAM_CONTENT_TYPE "multipart/x-mixed-replace;boundary=frame"
-#define STREAM_BOUNDARY "\r\n--frame\r\n"
-#define STREAM_PART "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n"
-
-static httpd_handle_t camera_httpd = nullptr;
+static int udp_sock = -1;
+static struct sockaddr_in dest_addr;
+static uint16_t frame_id = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────────
 //  Camera init
@@ -59,14 +75,14 @@ bool initCamera() {
     cfg.grab_mode    = CAMERA_GRAB_LATEST;
 
     if (psramFound()) {
-        cfg.frame_size   = FRAMESIZE_VGA;
-        cfg.jpeg_quality = 12;
+        cfg.frame_size   = FRAMESIZE_VGA;    // 640×480
+        cfg.jpeg_quality = 10;
         cfg.fb_count     = 2;
         cfg.fb_location  = CAMERA_FB_IN_PSRAM;
         Serial.println("[CAM] PSRAM – VGA, 2 buffers");
     } else {
         cfg.frame_size   = FRAMESIZE_QVGA;
-        cfg.jpeg_quality = 15;
+        cfg.jpeg_quality = 12;
         cfg.fb_count     = 1;
         cfg.fb_location  = CAMERA_FB_IN_DRAM;
         Serial.println("[CAM] No PSRAM – QVGA, 1 buffer");
@@ -77,128 +93,130 @@ bool initCamera() {
         Serial.printf("[CAM] Init failed: 0x%x\n", err);
         return false;
     }
+
     sensor_t *s = esp_camera_sensor_get();
-    if (s) Serial.printf("[CAM] Sensor PID: 0x%04X\n", s->id.PID);
+    if (s) {
+        Serial.printf("[CAM] Sensor PID: 0x%04X\n", s->id.PID);
+        s->set_vflip(s, 1);     // Flip vertical (caméra de recul)
+        s->set_hmirror(s, 1);   // Miroir horizontal
+    }
     Serial.println("[CAM] Camera ready");
     return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────
-//  WiFi
+//  WiFi SoftAP
 // ─────────────────────────────────────────────────────────────────────────────────
-void connectWiFi() {
-    Serial.printf("[WIFI] Connecting to %s", WIFI_SSID);
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED) {
-        if (millis() - t0 > 15000) {
-            Serial.println("\n[WIFI] Timeout – restarting");
-            ESP.restart();
-        }
-        Serial.print(".");
-        delay(500);
-    }
-    Serial.printf("\n[WIFI] Connected – IP: %s\n", WiFi.localIP().toString().c_str());
+void startSoftAP() {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
+    WiFi.softAP(AP_SSID);
+    Serial.printf("[WIFI] SoftAP started – SSID: %s  IP: %s\n",
+                  AP_SSID, WiFi.softAPIP().toString().c_str());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────
-//  MJPEG stream handler (ESP-IDF httpd)
+//  Init raw lwip UDP socket
 // ─────────────────────────────────────────────────────────────────────────────────
-static esp_err_t stream_handler(httpd_req_t *req) {
-    esp_err_t res;
-    char part_buf[64];
+void initUDP() {
+    udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (udp_sock < 0) {
+        Serial.println("[UDP] Socket creation failed");
+        return;
+    }
 
-    res = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
-    if (res != ESP_OK) return res;
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_set_hdr(req, "X-Framerate", "25");
+    // Enable broadcast
+    int broadcast = 1;
+    setsockopt(udp_sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
 
+    // Increase send buffer
+    int sndbuf = 32768;
+    setsockopt(udp_sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+    // Set destination: broadcast on subnet
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(RECEIVER_PORT);
+    dest_addr.sin_addr.s_addr = inet_addr("192.168.4.2");
+
+    Serial.printf("[UDP] Socket ready, broadcasting on port %d\n", RECEIVER_PORT);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────
+//  Send one JPEG frame via UDP chunks
+// ─────────────────────────────────────────────────────────────────────────────────
+void sendFrame(camera_fb_t *fb) {
+    if (udp_sock < 0) return;
+
+    uint16_t total_chunks = (fb->len + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
+    uint8_t packet[HEADER_SIZE + CHUNK_PAYLOAD];
+
+    for (uint16_t i = 0; i < total_chunks; i++) {
+        uint32_t offset = (uint32_t)i * CHUNK_PAYLOAD;
+        uint16_t size = (uint16_t)min((size_t)CHUNK_PAYLOAD, (size_t)(fb->len - offset));
+
+        // Header: frame_id(2) + chunk_id(2) + total_chunks(2) + chunk_size(2)
+        memcpy(packet + 0, &frame_id,      2);
+        memcpy(packet + 2, &i,             2);
+        memcpy(packet + 4, &total_chunks,  2);
+        memcpy(packet + 6, &size,          2);
+        // Payload
+        memcpy(packet + HEADER_SIZE, fb->buf + offset, size);
+
+        int ret = sendto(udp_sock, packet, HEADER_SIZE + size, 0,
+                         (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        if (ret < 0) {
+            // Back off if send buffer is full
+            vTaskDelay(pdMS_TO_TICKS(5));
+            // Retry once
+            sendto(udp_sock, packet, HEADER_SIZE + size, 0,
+                   (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        }
+    }
+    frame_id++;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────
+//  Streaming task (runs on core 1)
+// ─────────────────────────────────────────────────────────────────────────────────
+void streamTask(void *pvParameters) {
     unsigned long frames = 0;
     unsigned long t0 = millis();
+    bool clientWasConnected = false;
 
     while (true) {
+        // Wait for at least one station to connect
+        if (WiFi.softAPgetStationNum() == 0) {
+            if (clientWasConnected) {
+                Serial.println("[STREAM] Client disconnected – waiting...");
+                clientWasConnected = false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+        if (!clientWasConnected) {
+            Serial.println("[STREAM] Client connected – streaming started");
+            clientWasConnected = true;
+            frames = 0;
+            t0 = millis();
+        }
+
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) {
             Serial.println("[STREAM] Capture fail");
-            res = ESP_FAIL;
-            break;
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
         }
 
-        size_t hlen = snprintf(part_buf, sizeof(part_buf), STREAM_PART, (unsigned)fb->len);
-
-        res = httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
-        if (res == ESP_OK)
-            res = httpd_resp_send_chunk(req, part_buf, hlen);
-        if (res == ESP_OK)
-            res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
-
+        sendFrame(fb);
         esp_camera_fb_return(fb);
-        if (res != ESP_OK) break;
 
         frames++;
         if (frames % 30 == 0) {
             float fps = frames * 1000.0f / (millis() - t0);
             Serial.printf("[STREAM] %lu frames, %.1f fps\n", frames, fps);
         }
-    }
-    Serial.printf("[STREAM] Done: %lu frames\n", frames);
-    return res;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────────
-//  Throughput test handler (sends 1MB of DRAM data)
-// ─────────────────────────────────────────────────────────────────────────────────
-static esp_err_t test_handler(httpd_req_t *req) {
-    httpd_resp_set_type(req, "application/octet-stream");
-    static uint8_t buf[4096];
-    memset(buf, 0xAA, sizeof(buf));
-
-    unsigned long t0 = millis();
-    size_t total = 0;
-    for (int i = 0; i < 256; i++) {  // 256 * 4KB = 1MB
-        esp_err_t res = httpd_resp_send_chunk(req, (const char *)buf, sizeof(buf));
-        if (res != ESP_OK) break;
-        total += sizeof(buf);
-    }
-    httpd_resp_send_chunk(req, NULL, 0);  // End chunked response
-    unsigned long dt = millis() - t0;
-    Serial.printf("[TEST] Sent %u bytes in %lu ms = %.0f KB/s\n",
-                  (unsigned)total, dt, total / 1.024f / dt);
-    return ESP_OK;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────────
-//  Single capture handler
-// ─────────────────────────────────────────────────────────────────────────────────
-static esp_err_t capture_handler(httpd_req_t *req) {
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-    httpd_resp_set_type(req, "image/jpeg");
-    httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
-    esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
-    esp_camera_fb_return(fb);
-    Serial.printf("[CAPTURE] Sent %u bytes\n", (unsigned)fb->len);
-    return res;
-}
-
-void startHTTPD() {
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.server_port = 5000;
-    config.ctrl_port = 32768;
-    config.max_uri_handlers = 4;
-
-    if (httpd_start(&camera_httpd, &config) == ESP_OK) {
-        httpd_uri_t stream_uri = { .uri = "/", .method = HTTP_GET, .handler = stream_handler };
-        httpd_uri_t capture_uri = { .uri = "/capture", .method = HTTP_GET, .handler = capture_handler };
-        httpd_uri_t test_uri = { .uri = "/test", .method = HTTP_GET, .handler = test_handler };
-        httpd_register_uri_handler(camera_httpd, &stream_uri);
-        httpd_register_uri_handler(camera_httpd, &capture_uri);
-        httpd_register_uri_handler(camera_httpd, &test_uri);
-        Serial.println("[HTTP] Server started");
+        vTaskDelay(pdMS_TO_TICKS(1));   // yield
     }
 }
 
@@ -208,7 +226,7 @@ void startHTTPD() {
 void setup() {
     Serial.begin(115200);
     delay(1000);
-    Serial.println("\n=== ESP32-S3 MJPEG Streamer ===");
+    Serial.println("\n=== TeslaCam – Camera (SoftAP + UDP) ===");
 
     pinMode(48, OUTPUT);
     digitalWrite(48, LOW);
@@ -220,11 +238,14 @@ void setup() {
         while (true) delay(1000);
     }
 
-    connectWiFi();
-    startHTTPD();
-    Serial.printf("[STREAM] http://%s:5000/         MJPEG stream\n", WiFi.localIP().toString().c_str());
-    Serial.printf("[STREAM] http://%s:5000/capture  Single JPEG\n", WiFi.localIP().toString().c_str());
-    Serial.printf("[STREAM] http://%s:5000/test     1MB throughput test\n", WiFi.localIP().toString().c_str());
+    startSoftAP();
+    WiFi.setSleep(false);  // Disable WiFi power saving for max throughput
+    initUDP();
+
+    // Launch streaming on core 1
+    xTaskCreatePinnedToCore(streamTask, "stream", 8192, NULL, 1, NULL, 1);
+    Serial.println("[STREAM] UDP streaming started on core 1");
+    Serial.printf("[STREAM] Broadcasting on port %d\n", RECEIVER_PORT);
 }
 
 void loop() {

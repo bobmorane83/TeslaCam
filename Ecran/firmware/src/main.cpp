@@ -1,13 +1,18 @@
 /*
- * LVGL 9.5 – Animated green arc gauge on JC3636W518C (ST77916, 360×360 round)
+ * TeslaCam — ESP32-S3 Display (JC3636W518C, ST77916, 360×360 round)
+ * Wi-Fi Station + UDP receiver — decodes JPEG and displays on screen.
  *
- * Green arc (15 px wide) on the extreme edge, spans 270°,
- * fills in 10 s then resets to 0 and repeats.
+ * Connects to the Camera SoftAP "TeslaCam" and receives JPEG frames
+ * via UDP chunks on port 5000. Decodes with JPEGDEC and displays via
+ * Arduino_GFX with center-crop from VGA (640×480) to 360×360.
  */
 
 #include <Arduino.h>
+#include <WiFi.h>
 #include <Arduino_GFX_Library.h>
-#include "lvgl.h"
+#include <JPEGDEC.h>
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
 
 /* ── Display hardware ────────────────────────────────────────────────── */
 #define SCREEN_W 360
@@ -24,123 +29,260 @@ Arduino_GFX *gfx = new Arduino_ST77916(
     st77916_150_init_operations,
     sizeof(st77916_150_init_operations));
 
-/* ── LVGL flush callback ────────────────────────────────────────────── */
-static void my_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
-{
-    uint32_t w = (uint32_t)(area->x2 - area->x1 + 1);
-    uint32_t h = (uint32_t)(area->y2 - area->y1 + 1);
-    gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t *)px_map, w, h);
-    lv_display_flush_ready(disp);
+/* ── WiFi ────────────────────────────────────────────────────────────── */
+static const char *AP_SSID = "TeslaCam";
+static const IPAddress STATIC_IP(192, 168, 4, 2);
+static const IPAddress GATEWAY(192, 168, 4, 1);
+static const IPAddress SUBNET(255, 255, 255, 0);
+
+
+/* ── UDP ─────────────────────────────────────────────────────────────── */
+#define UDP_PORT       5000
+#define HEADER_SIZE    8
+#define CHUNK_PAYLOAD  1400
+#define MAX_FRAME_SIZE 65000
+
+static int udp_sock = -1;
+
+/* ── Double-buffered frame reception ─────────────────────────────────── */
+static uint8_t *frameBuf[2];       // Two JPEG buffers in PSRAM
+static uint8_t  recvIdx    = 0;    // Buffer being filled
+static uint8_t  dispIdx    = 1;    // Buffer ready for display
+static size_t   dispLen    = 0;    // Size of last complete frame
+static volatile bool frameReady = false;
+
+static uint16_t currentFrameId  = 0;
+static uint16_t expectedChunks  = 0;
+static uint16_t receivedChunks  = 0;
+static size_t   recvFrameLen    = 0;
+
+/* ── Timeout ─────────────────────────────────────────────────────────── */
+static unsigned long lastFrameTime = 0;
+#define FRAME_TIMEOUT_MS 500
+static bool screenBlank = true;
+
+/* ── Crop parameters (VGA 640×480 → 360×360 center crop) ────────────── */
+static int cropX = 0;   // Computed after first JPEG decode
+static int cropY = 0;
+
+/* ── JPEGDEC draw callback ───────────────────────────────────────────── */
+static int jpegDrawCallback(JPEGDRAW *pDraw) {
+    // pDraw->x, pDraw->y: position in the source image
+    // pDraw->iWidth, pDraw->iHeight: block size
+    // pDraw->pPixels: RGB565 pixel data
+
+    // Compute intersection with crop region
+    int srcX1 = pDraw->x;
+    int srcY1 = pDraw->y;
+    int srcX2 = pDraw->x + pDraw->iWidth;
+    int srcY2 = pDraw->y + pDraw->iHeight;
+
+    int cX1 = cropX;
+    int cY1 = cropY;
+    int cX2 = cropX + SCREEN_W;
+    int cY2 = cropY + SCREEN_H;
+
+    // Clip to crop region
+    int ix1 = max(srcX1, cX1);
+    int iy1 = max(srcY1, cY1);
+    int ix2 = min(srcX2, cX2);
+    int iy2 = min(srcY2, cY2);
+
+    if (ix1 >= ix2 || iy1 >= iy2) return 1; // No overlap
+
+    // Screen coordinates
+    int screenX = ix1 - cropX;
+    int screenY = iy1 - cropY;
+    int drawW   = ix2 - ix1;
+    int drawH   = iy2 - iy1;
+
+    // Offset into the MCU block data
+    int offX = ix1 - srcX1;
+    int offY = iy1 - srcY1;
+
+    // Draw line by line from the block
+    for (int row = 0; row < drawH; row++) {
+        uint16_t *src = pDraw->pPixels + (offY + row) * pDraw->iWidth + offX;
+        gfx->draw16bitRGBBitmap(screenX, screenY + row, src, drawW, 1);
+    }
+
+    return 1; // Continue decoding
 }
 
-/* ── Animation callback ─────────────────────────────────────────────── */
-static lv_obj_t *arc;
+/* ── Connect to Camera SoftAP ────────────────────────────────────────── */
+void connectToCamera() {
+    WiFi.mode(WIFI_STA);
+    WiFi.config(STATIC_IP, GATEWAY, SUBNET);
+    WiFi.begin(AP_SSID);
 
-static void arc_anim_cb(void *obj, int32_t value)
-{
-    lv_arc_set_value((lv_obj_t *)obj, value);
+    Serial.printf("[WIFI] Connecting to %s", AP_SSID);
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        if (millis() - t0 > 15000) {
+            Serial.println("\n[WIFI] Timeout – restarting");
+            ESP.restart();
+        }
+        Serial.print(".");
+        delay(500);
+    }
+    Serial.printf("\n[WIFI] Connected – IP: %s\n", WiFi.localIP().toString().c_str());
 }
 
-static void arc_anim_completed_cb(lv_anim_t *a)
-{
-    /* Restart from 0 */
-    lv_anim_t anim;
-    lv_anim_init(&anim);
-    lv_anim_set_var(&anim, arc);
-    lv_anim_set_exec_cb(&anim, arc_anim_cb);
-    lv_anim_set_values(&anim, 0, 270);
-    lv_anim_set_duration(&anim, 10000);
-    lv_anim_set_completed_cb(&anim, arc_anim_completed_cb);
-    lv_anim_start(&anim);
+/* ── Process one incoming UDP packet ─────────────────────────────────── */
+void processPacket(uint8_t *data, size_t len) {
+    if (len < HEADER_SIZE) return;
+
+    uint16_t frameId, chunkId, totalChunks, chunkSize;
+    memcpy(&frameId,     data + 0, 2);
+    memcpy(&chunkId,     data + 2, 2);
+    memcpy(&totalChunks, data + 4, 2);
+    memcpy(&chunkSize,   data + 6, 2);
+
+    // Validate chunk size
+    if (chunkSize > CHUNK_PAYLOAD || chunkSize + HEADER_SIZE > len) return;
+
+    // New frame detected — reset receiver state
+    if (frameId != currentFrameId) {
+        currentFrameId = frameId;
+        expectedChunks = totalChunks;
+        receivedChunks = 0;
+        recvFrameLen   = 0;
+    }
+
+    // Copy chunk payload into receive buffer
+    uint32_t offset = (uint32_t)chunkId * CHUNK_PAYLOAD;
+    if (offset + chunkSize > MAX_FRAME_SIZE) return;  // Safety check
+
+    memcpy(frameBuf[recvIdx] + offset, data + HEADER_SIZE, chunkSize);
+
+    // Track the total size (last chunk determines actual end)
+    size_t endPos = offset + chunkSize;
+    if (endPos > recvFrameLen) recvFrameLen = endPos;
+
+    receivedChunks++;
+
+    // Frame complete?
+    if (receivedChunks == expectedChunks) {
+        // Swap buffers
+        dispLen = recvFrameLen;
+        uint8_t tmp = recvIdx;
+        recvIdx = dispIdx;
+        dispIdx = tmp;
+        frameReady = true;
+        lastFrameTime = millis();
+
+        receivedChunks = 0;
+        recvFrameLen = 0;
+    }
+}
+
+/* ── Decode and display a complete JPEG frame ────────────────────────── */
+void decodeAndDisplay() {
+    static JPEGDEC jpeg;
+
+    if (jpeg.openRAM(frameBuf[dispIdx], dispLen, jpegDrawCallback)) {
+        int imgW = jpeg.getWidth();
+        int imgH = jpeg.getHeight();
+
+        // Compute center crop offsets
+        cropX = max(0, (imgW - SCREEN_W) / 2);
+        cropY = max(0, (imgH - SCREEN_H) / 2);
+
+        jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+        jpeg.decode(0, 0, 0); // Full decode, no scaling
+        jpeg.close();
+
+        if (screenBlank) screenBlank = false;
+    } else {
+        Serial.println("[JPEG] Decode failed");
+    }
 }
 
 /* ── Setup ───────────────────────────────────────────────────────────── */
-void setup()
-{
+void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.println("LVGL 9.5 arc gauge – init");
+    Serial.println("\n=== TeslaCam – Display (Station + UDP) ===");
 
-    /* Display hardware */
+    // Allocate double buffers in PSRAM
+    frameBuf[0] = (uint8_t *)heap_caps_malloc(MAX_FRAME_SIZE, MALLOC_CAP_SPIRAM);
+    frameBuf[1] = (uint8_t *)heap_caps_malloc(MAX_FRAME_SIZE, MALLOC_CAP_SPIRAM);
+    if (!frameBuf[0] || !frameBuf[1]) {
+        Serial.println("[FATAL] PSRAM alloc failed");
+        while (true) delay(1000);
+    }
+    Serial.println("[MEM] Frame buffers allocated (2 × 65 KB PSRAM)");
+
+    // Display init
     if (!gfx->begin()) {
-        Serial.println("GFX begin FAILED");
+        Serial.println("[FATAL] GFX begin failed");
         while (true) delay(1000);
     }
     gfx->fillScreen(0x0000);
     pinMode(TFT_BL, OUTPUT);
     digitalWrite(TFT_BL, HIGH);
-    Serial.println("Display OK");
+    Serial.println("[GFX] Display OK");
 
-    /* LVGL init */
-    lv_init();
-    Serial.println("lv_init OK");
+    // Connect to Camera AP
+    connectToCamera();
+    WiFi.setSleep(false);
 
-    /* Create display */
-    lv_display_t *disp = lv_display_create(SCREEN_W, SCREEN_H);
-    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
-    lv_display_set_flush_cb(disp, my_flush_cb);
-
-    /* Allocate double buffers in PSRAM */
-    static const uint32_t buf_px = SCREEN_W * 40;           /* 40 lines */
-    static const uint32_t buf_bytes = buf_px * sizeof(uint16_t);
-    uint8_t *buf1 = (uint8_t *)heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM);
-    uint8_t *buf2 = (uint8_t *)heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM);
-    if (!buf1 || !buf2) {
-        Serial.println("PSRAM alloc FAILED");
+    // Create raw lwip UDP socket
+    udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (udp_sock < 0) {
+        Serial.println("[FATAL] UDP socket creation failed");
         while (true) delay(1000);
     }
-    lv_display_set_buffers(disp, buf1, buf2, buf_bytes,
-                           LV_DISPLAY_RENDER_MODE_PARTIAL);
-    Serial.println("Display buffers OK");
 
-    /* ── Build UI ────────────────────────────────────────────────────── */
-    lv_obj_t *scr = lv_screen_active();
-    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+    struct sockaddr_in bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(UDP_PORT);
+    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(udp_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+        Serial.println("[FATAL] UDP bind failed");
+        while (true) delay(1000);
+    }
 
-    /* Arc widget */
-    arc = lv_arc_create(scr);
-    lv_obj_set_size(arc, SCREEN_W, SCREEN_H);
-    lv_obj_center(arc);
+    // Set receive timeout to avoid blocking forever
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 10000;  // 10ms timeout
+    setsockopt(udp_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    /* Remove the knob */
-    lv_obj_set_style_pad_all(arc, 0, LV_PART_KNOB);
-    lv_obj_set_style_size(arc, 0, 0, LV_PART_KNOB);
+    // Increase receive buffer
+    int rcvbuf = 65536;
+    setsockopt(udp_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
-    /* Background arc (track) – dark gray, 15 px */
-    lv_obj_set_style_arc_width(arc, 15, LV_PART_MAIN);
-    lv_obj_set_style_arc_color(arc, lv_color_make(40, 40, 40), LV_PART_MAIN);
-    lv_obj_set_style_arc_rounded(arc, false, LV_PART_MAIN);
+    Serial.printf("[UDP] Listening on port %d\n", UDP_PORT);
 
-    /* Indicator arc – green, 15 px */
-    lv_obj_set_style_arc_width(arc, 15, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(arc, lv_color_make(0, 220, 60), LV_PART_INDICATOR);
-    lv_obj_set_style_arc_rounded(arc, false, LV_PART_INDICATOR);
-
-    /* Angles: 270° sweep  (default is 135→45 which is 270° already) */
-    lv_arc_set_bg_angles(arc, 135, 45);
-    lv_arc_set_range(arc, 0, 270);
-    lv_arc_set_value(arc, 0);
-    lv_arc_set_mode(arc, LV_ARC_MODE_NORMAL);
-
-    /* Disable touch interaction */
-    lv_obj_remove_flag(arc, LV_OBJ_FLAG_CLICKABLE);
-
-    /* ── Start animation ─────────────────────────────────────────────── */
-    lv_anim_t anim;
-    lv_anim_init(&anim);
-    lv_anim_set_var(&anim, arc);
-    lv_anim_set_exec_cb(&anim, arc_anim_cb);
-    lv_anim_set_values(&anim, 0, 270);
-    lv_anim_set_duration(&anim, 10000);
-    lv_anim_set_completed_cb(&anim, arc_anim_completed_cb);
-    lv_anim_start(&anim);
-
-    Serial.println("Arc gauge ready – animation started");
+    lastFrameTime = millis();
 }
 
 /* ── Loop ────────────────────────────────────────────────────────────── */
-void loop()
-{
-    lv_timer_handler();
-    delay(5);
+void loop() {
+    // Receive pending UDP packets via raw lwip socket
+    uint8_t buf[HEADER_SIZE + CHUNK_PAYLOAD];
+    int maxPackets = 50;
+
+    while (maxPackets-- > 0) {
+        int len = recvfrom(udp_sock, buf, sizeof(buf), 0, NULL, NULL);
+        if (len <= 0) break;  // No more packets or timeout
+        processPacket(buf, len);
+    }
+
+    // Display frame if ready
+    if (frameReady) {
+        frameReady = false;
+        decodeAndDisplay();
+    }
+
+    // Timeout: black screen if no frame for 500ms
+    if (!screenBlank && (millis() - lastFrameTime > FRAME_TIMEOUT_MS)) {
+        gfx->fillScreen(0x0000);
+        screenBlank = true;
+        Serial.println("[TIMEOUT] No frame – screen blanked");
+    }
+
+    delay(1);  // Yield to FreeRTOS scheduler / WDT
 }
