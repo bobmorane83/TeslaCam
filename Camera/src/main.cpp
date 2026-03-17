@@ -47,6 +47,12 @@ static int udp_sock = -1;
 static struct sockaddr_in dest_addr;
 static uint16_t frame_id = 0;
 
+// ── Control channel (port 5001) ─────────────────────────────────────────────────
+#define CTRL_PORT 5001
+#define CTRL_TIMEOUT_MS 5000       // Stop streaming if no heartbeat for 5s
+static volatile bool streamEnabled = false;
+static volatile unsigned long lastCtrlTime = 0;
+
 // ─────────────────────────────────────────────────────────────────────────────────
 //  Camera init
 // ─────────────────────────────────────────────────────────────────────────────────
@@ -174,26 +180,88 @@ void sendFrame(camera_fb_t *fb) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────
+//  Control listener task — receives STRT/STOP on port 5001
+// ─────────────────────────────────────────────────────────────────────────────────
+void ctrlTask(void *pvParameters) {
+    int ctrl_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (ctrl_sock < 0) {
+        Serial.println("[CTRL] Socket creation failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    struct sockaddr_in bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(CTRL_PORT);
+    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(ctrl_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+        Serial.println("[CTRL] Bind failed");
+        close(ctrl_sock);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    Serial.printf("[CTRL] Listening on port %d\n", CTRL_PORT);
+
+    char buf[8];
+    while (true) {
+        int len = recvfrom(ctrl_sock, buf, sizeof(buf) - 1, 0, NULL, NULL);
+        if (len >= 4) {
+            buf[len] = '\0';
+            if (memcmp(buf, "STRT", 4) == 0) {
+                if (!streamEnabled) {
+                    Serial.println("[CTRL] START received — streaming enabled");
+                }
+                streamEnabled = true;
+                lastCtrlTime = millis();
+            } else if (memcmp(buf, "STOP", 4) == 0) {
+                if (streamEnabled) {
+                    Serial.println("[CTRL] STOP received — streaming disabled");
+                }
+                streamEnabled = false;
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────
 //  Streaming task (runs on core 1)
 // ─────────────────────────────────────────────────────────────────────────────────
 void streamTask(void *pvParameters) {
     unsigned long frames = 0;
     unsigned long t0 = millis();
-    bool clientWasConnected = false;
+    bool wasStreaming = false;
 
     while (true) {
-        // Wait for at least one station to connect
-        if (WiFi.softAPgetStationNum() == 0) {
-            if (clientWasConnected) {
-                Serial.println("[STREAM] Client disconnected – waiting...");
-                clientWasConnected = false;
+        // Wait for client connection AND stream enabled via control command
+        if (WiFi.softAPgetStationNum() == 0 || !streamEnabled) {
+            if (wasStreaming) {
+                const char *reason = (WiFi.softAPgetStationNum() == 0)
+                    ? "client disconnected" : "STOP received";
+                Serial.printf("[STREAM] Paused — %s\n", reason);
+                wasStreaming = false;
             }
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(100));
+
+            // Heartbeat timeout: auto-disable if no STRT for 5s
+            if (streamEnabled && (millis() - lastCtrlTime > CTRL_TIMEOUT_MS)) {
+                streamEnabled = false;
+                Serial.println("[CTRL] Heartbeat timeout — streaming disabled");
+            }
             continue;
         }
-        if (!clientWasConnected) {
-            Serial.println("[STREAM] Client connected – streaming started");
-            clientWasConnected = true;
+
+        // Heartbeat timeout check during streaming
+        if (millis() - lastCtrlTime > CTRL_TIMEOUT_MS) {
+            streamEnabled = false;
+            Serial.println("[CTRL] Heartbeat timeout — streaming disabled");
+            continue;
+        }
+
+        if (!wasStreaming) {
+            Serial.println("[STREAM] Streaming started");
+            wasStreaming = true;
             frames = 0;
             t0 = millis();
         }
@@ -239,10 +307,13 @@ void setup() {
     WiFi.setSleep(false);  // Disable WiFi power saving for max throughput
     initUDP();
 
+    // Launch control listener on core 0
+    xTaskCreatePinnedToCore(ctrlTask, "ctrl", 4096, NULL, 1, NULL, 0);
+    Serial.printf("[CTRL] Control listener started on core 0 (port %d)\n", CTRL_PORT);
+
     // Launch streaming on core 1
     xTaskCreatePinnedToCore(streamTask, "stream", 8192, NULL, 1, NULL, 1);
-    Serial.println("[STREAM] UDP streaming started on core 1");
-    Serial.printf("[STREAM] Broadcasting on port %d\n", RECEIVER_PORT);
+    Serial.println("[STREAM] Streaming task started on core 1 (waiting for STRT command)");
 }
 
 void loop() {
