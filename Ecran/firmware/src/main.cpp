@@ -447,12 +447,8 @@ void loop() {
             taskYIELD();
         }
 
-        // Timeout: show idle only after first frame has arrived and then gone silent
-        if (firstFrameReceived && !idleScreenDrawn &&
-            (now - lastFrameTime > FRAME_TIMEOUT_MS)) {
-            drawIdleScreen();
-            Serial.println("[TIMEOUT] No frame – idle screen");
-        }
+        // No automatic idle screen during active streaming.
+        // A frozen last frame is safer for a backup camera than flashing idle.
     } else {
         // Not streaming — draw idle if not already shown
         if (!idleScreenDrawn) {
