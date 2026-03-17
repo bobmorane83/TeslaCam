@@ -50,7 +50,7 @@ static uint16_t frame_id = 0;
 // ── Control channel (port 5001) ─────────────────────────────────────────────────
 #define CTRL_PORT 5001
 #define CTRL_TIMEOUT_MS 5000       // Stop streaming if no heartbeat for 5s
-static volatile bool streamEnabled = false;
+static volatile bool streamEnabled = false;    // Sleep by default, wait for STRT
 static volatile unsigned long lastCtrlTime = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────────
@@ -145,7 +145,7 @@ void initUDP() {
     dest_addr.sin_port = htons(RECEIVER_PORT);
     dest_addr.sin_addr.s_addr = inet_addr("192.168.4.2");
 
-    Serial.printf("[UDP] Socket ready, broadcasting on port %d\n", RECEIVER_PORT);
+    Serial.printf("[UDP] Socket ready, target 192.168.4.2:%d\n", RECEIVER_PORT);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────
@@ -156,6 +156,7 @@ void sendFrame(camera_fb_t *fb) {
 
     uint16_t total_chunks = (fb->len + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
     uint8_t packet[HEADER_SIZE + CHUNK_PAYLOAD];
+    int errors = 0;
 
     for (uint16_t i = 0; i < total_chunks; i++) {
         uint32_t offset = (uint32_t)i * CHUNK_PAYLOAD;
@@ -172,83 +173,100 @@ void sendFrame(camera_fb_t *fb) {
         int ret = sendto(udp_sock, packet, HEADER_SIZE + size, 0,
                          (struct sockaddr *)&dest_addr, sizeof(dest_addr));
         if (ret < 0) {
-            // Skip chunk on failure — don't wait, minimize latency
+            errors++;
+            if (errors == 1) {
+                Serial.printf("[UDP] sendto err: errno=%d, heap=%u\n",
+                              errno, ESP.getFreeHeap());
+            }
             continue;
         }
+
+        // Pace chunks: brief yield every 3 chunks to let WiFi TX drain
+        if (i % 3 == 2) vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    // Debug: log first 3 frames and any with errors
+    if (frame_id < 3 || errors > 0) {
+        Serial.printf("[UDP] Frame %u: %u chunks, %u bytes, %d errors\n",
+                      frame_id, total_chunks, fb->len, errors);
     }
     frame_id++;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────
-//  Control listener task — receives STRT/STOP on port 5001
+//  Streaming task — handles both control commands and frame streaming (core 1)
+//  Core 0 is kept entirely free for WiFi driver processing.
 // ─────────────────────────────────────────────────────────────────────────────────
-void ctrlTask(void *pvParameters) {
+void streamTask(void *pvParameters) {
+    // Create and bind control socket (non-blocking)
     int ctrl_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (ctrl_sock < 0) {
         Serial.println("[CTRL] Socket creation failed");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    struct sockaddr_in bind_addr;
-    memset(&bind_addr, 0, sizeof(bind_addr));
-    bind_addr.sin_family = AF_INET;
-    bind_addr.sin_port = htons(CTRL_PORT);
-    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (bind(ctrl_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-        Serial.println("[CTRL] Bind failed");
-        close(ctrl_sock);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    Serial.printf("[CTRL] Listening on port %d\n", CTRL_PORT);
-
-    char buf[8];
-    while (true) {
-        int len = recvfrom(ctrl_sock, buf, sizeof(buf) - 1, 0, NULL, NULL);
-        if (len >= 4) {
-            buf[len] = '\0';
-            if (memcmp(buf, "STRT", 4) == 0) {
-                if (!streamEnabled) {
-                    Serial.println("[CTRL] START received — streaming enabled");
-                }
-                streamEnabled = true;
-                lastCtrlTime = millis();
-            } else if (memcmp(buf, "STOP", 4) == 0) {
-                if (streamEnabled) {
-                    Serial.println("[CTRL] STOP received — streaming disabled");
-                }
-                streamEnabled = false;
-            }
+    } else {
+        struct sockaddr_in bind_addr;
+        memset(&bind_addr, 0, sizeof(bind_addr));
+        bind_addr.sin_family = AF_INET;
+        bind_addr.sin_port = htons(CTRL_PORT);
+        bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (bind(ctrl_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+            Serial.println("[CTRL] Bind failed");
+            close(ctrl_sock);
+            ctrl_sock = -1;
         }
     }
-}
+    Serial.printf("[CTRL] Listening on port %d (non-blocking)\n", CTRL_PORT);
 
-// ─────────────────────────────────────────────────────────────────────────────────
-//  Streaming task (runs on core 1)
-// ─────────────────────────────────────────────────────────────────────────────────
-void streamTask(void *pvParameters) {
+    // Wait for first station to connect, then do one-time ARP warm-up
+    Serial.println("[STREAM] Waiting for station...");
+    while (WiFi.softAPgetStationNum() == 0) {
+        // Still poll ctrl while waiting
+        if (ctrl_sock >= 0) {
+            char cbuf[8];
+            recvfrom(ctrl_sock, cbuf, sizeof(cbuf), MSG_DONTWAIT, NULL, NULL);
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    Serial.println("[STREAM] Station connected — ARP warm-up (2s)");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    Serial.println("[STREAM] Ready — waiting for STRT command");
+    lastCtrlTime = millis();  // prevent immediate heartbeat timeout
+
     unsigned long frames = 0;
     unsigned long t0 = millis();
     bool wasStreaming = false;
 
     while (true) {
-        // Wait for client connection AND stream enabled via control command
-        if (WiFi.softAPgetStationNum() == 0 || !streamEnabled) {
+        // Poll control commands (non-blocking)
+        if (ctrl_sock >= 0) {
+            char cbuf[8];
+            int clen = recvfrom(ctrl_sock, cbuf, sizeof(cbuf) - 1,
+                                MSG_DONTWAIT, NULL, NULL);
+            if (clen >= 4) {
+                cbuf[clen] = '\0';
+                if (memcmp(cbuf, "STRT", 4) == 0) {
+                    // Only enable if a station is connected (prevents stale STRT)
+                    if (WiFi.softAPgetStationNum() > 0) {
+                        if (!streamEnabled) {
+                            Serial.println("[CTRL] START received — streaming enabled");
+                        }
+                        streamEnabled = true;
+                        lastCtrlTime = millis();
+                    }
+                } else if (memcmp(cbuf, "STOP", 4) == 0) {
+                    if (streamEnabled) {
+                        Serial.println("[CTRL] STOP received — streaming disabled");
+                    }
+                    streamEnabled = false;
+                }
+            }
+        }
+
+        // Wait for stream to be enabled
+        if (!streamEnabled) {
             if (wasStreaming) {
-                const char *reason = (WiFi.softAPgetStationNum() == 0)
-                    ? "client disconnected" : "STOP received";
-                Serial.printf("[STREAM] Paused — %s\n", reason);
+                Serial.println("[STREAM] Paused — STOP received");
                 wasStreaming = false;
             }
-            vTaskDelay(pdMS_TO_TICKS(100));
-
-            // Heartbeat timeout: auto-disable if no STRT for 5s
-            if (streamEnabled && (millis() - lastCtrlTime > CTRL_TIMEOUT_MS)) {
-                streamEnabled = false;
-                Serial.println("[CTRL] Heartbeat timeout — streaming disabled");
-            }
+            vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
 
@@ -260,7 +278,18 @@ void streamTask(void *pvParameters) {
         }
 
         if (!wasStreaming) {
-            Serial.println("[STREAM] Streaming started");
+            // Don't start sending until station is truly connected
+            if (WiFi.softAPgetStationNum() == 0) {
+                vTaskDelay(pdMS_TO_TICKS(200));
+                continue;
+            }
+            // Drain stale ctrl commands
+            if (ctrl_sock >= 0) {
+                char drain[8];
+                while (recvfrom(ctrl_sock, drain, sizeof(drain), MSG_DONTWAIT, NULL, NULL) > 0) {}
+            }
+            Serial.printf("[STREAM] Streaming started (stations=%d)\n",
+                          WiFi.softAPgetStationNum());
             wasStreaming = true;
             frames = 0;
             t0 = millis();
@@ -279,7 +308,8 @@ void streamTask(void *pvParameters) {
         frames++;
         if (frames % 60 == 0) {
             float fps = frames * 1000.0f / (millis() - t0);
-            Serial.printf("[STREAM] %lu frames, %.1f fps\n", frames, fps);
+            Serial.printf("[STREAM] %lu frames, %.1f fps, stations=%d\n",
+                          frames, fps, WiFi.softAPgetStationNum());
         }
         taskYIELD();   // minimal yield, no vTaskDelay
     }
@@ -307,13 +337,9 @@ void setup() {
     WiFi.setSleep(false);  // Disable WiFi power saving for max throughput
     initUDP();
 
-    // Launch control listener on core 0
-    xTaskCreatePinnedToCore(ctrlTask, "ctrl", 4096, NULL, 1, NULL, 0);
-    Serial.printf("[CTRL] Control listener started on core 0 (port %d)\n", CTRL_PORT);
-
-    // Launch streaming on core 1
+    // Launch streaming + control task on core 1 (core 0 free for WiFi driver)
     xTaskCreatePinnedToCore(streamTask, "stream", 8192, NULL, 1, NULL, 1);
-    Serial.println("[STREAM] Streaming task started on core 1 (waiting for STRT command)");
+    Serial.println("[STREAM] Task started on core 1 (waiting for STRT command)");
 }
 
 void loop() {

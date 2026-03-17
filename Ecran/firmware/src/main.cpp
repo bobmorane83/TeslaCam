@@ -4,11 +4,10 @@
  *
  * Architecture:
  *   Core 0: UDP recv task (high priority, blocking recv, never misses packets)
- *   Core 1: Main loop — JPEG decode to screen buffer, then batch draw
+ *   Core 1: Main loop — touch polling, JPEG decode to screen buffer, batch draw
  *
- * Triple-buffered JPEG reception prevents contention between recv and display.
- * Screen buffer in PSRAM allows one big QSPI transfer per frame instead of
- * thousands of tiny per-line draws.
+ * Touch on screen toggles streaming START/STOP via UDP control channel (port 5001).
+ * Camera is in sleep mode by default — only captures on STRT command.
  */
 
 #include <Arduino.h>
@@ -35,28 +34,13 @@ Arduino_GFX *gfx = new Arduino_ST77916(
     st77916_150_init_operations,
     sizeof(st77916_150_init_operations));
 
-
-/* -- Touch (CST816S via I2C polling) ---------------------------------------- */
-#define TOUCH_SDA       7
-#define TOUCH_SCL       8
-#define CST816S_ADDR    0x15
-#define TOUCH_REG_GESTURE 0x01
-#define GESTURE_SINGLE_CLICK 0x05
-#define TOUCH_POLL_MS   50
-#define TOUCH_COOLDOWN_MS 500
-
-/* -- Control channel --------------------------------------------------------- */
-#define CTRL_PORT       5001
-#define CAMERA_IP       "192.168.4.1"
-#define HEARTBEAT_MS    2000
-
 /* ── WiFi ────────────────────────────────────────────────────────────── */
 static const char *AP_SSID = "TeslaCam";
 static const IPAddress STATIC_IP(192, 168, 4, 2);
 static const IPAddress GATEWAY(192, 168, 4, 1);
 static const IPAddress SUBNET(255, 255, 255, 0);
 
-/* ── UDP ─────────────────────────────────────────────────────────────── */
+/* ── UDP video (port 5000) ───────────────────────────────────────────── */
 #define UDP_PORT       5000
 #define HEADER_SIZE    8
 #define CHUNK_PAYLOAD  1400
@@ -64,43 +48,93 @@ static const IPAddress SUBNET(255, 255, 255, 0);
 
 static int udp_sock = -1;
 
+/* ── UDP control (port 5001) — Écran → Camera ────────────────────────── */
+#define CTRL_PORT      5001
+#define CTRL_RESEND_MS 2000        // Resend STRT every 2s as heartbeat
+static int ctrl_sock = -1;
+static struct sockaddr_in ctrl_dest;
+
+/* ── Touch controller CST816S (I2C 0x15, SDA=7, SCL=8) ──────────────── */
+#define TOUCH_SDA  7
+#define TOUCH_SCL  8
+#define TOUCH_ADDR 0x15
+#define TOUCH_DEBOUNCE_MS 300      // Ignore touches within 300ms of last toggle
+
+static bool touchedPrev       = false;   // Previous touch state (for edge detect)
+static unsigned long lastToggleMs = 0;   // Debounce timestamp
+
+/* ── Streaming state ─────────────────────────────────────────────────── */
+static bool streamActive      = false;   // Are we requesting streaming?
+static unsigned long lastCtrlSendMs = 0; // Last STRT/STOP sent timestamp
+static bool idleScreenDrawn   = false;   // Have we drawn the idle screen?
+
 /* ── Triple-buffered JPEG reception ──────────────────────────────────── */
-static uint8_t *jpegBuf[3];               // 3 JPEG buffers in PSRAM
+static uint8_t *jpegBuf[3];
 static SemaphoreHandle_t tbMutex;
-static int tbWrite   = 0;                 // Recv task writes here
-static int tbReady   = -1;                // Last completed frame (-1 = none)
-static int tbDisplay = -1;                // Display task reading (-1 = none)
+static int tbWrite   = 0;
+static int tbReady   = -1;
+static int tbDisplay = -1;
 static size_t tbReadyLen = 0;
 
-// Recv-task-only state (no mutex needed)
 static uint16_t currentFrameId  = 0;
 static uint16_t expectedChunks  = 0;
 static uint16_t receivedChunks  = 0;
 static size_t   recvFrameLen    = 0;
 
 /* ── Screen buffer for batch display ─────────────────────────────────── */
-static uint16_t *screenBuf;               // SCREEN_W × SCREEN_H in PSRAM
+static uint16_t *screenBuf;
 
 /* ── Timeout ─────────────────────────────────────────────────────────── */
 static volatile unsigned long lastFrameTime = 0;
 #define FRAME_TIMEOUT_MS 500
 static bool screenBlank = true;
 
-/* -- Streaming state (touch toggle) ----------------------------------------- */
-static bool streamingActive   = false;
-static unsigned long lastTouchTime    = 0;
-static unsigned long lastHeartbeatTime = 0;
-static int ctrl_sock = -1;
-static bool idleScreenDrawn = false;
-
-
 /* ── Crop / center parameters ────────────────────────────────────────── */
-static int cropX    = 0;   // Source image crop offset X
-static int cropY    = 0;   // Source image crop offset Y
-static int screenOX = 0;   // Screen draw offset X (centering)
-static int screenOY = 0;   // Screen draw offset Y (centering)
-static int drawW    = SCREEN_W;  // Actual drawn width
-static int drawH    = SCREEN_H;  // Actual drawn height
+static int cropX    = 0;
+static int cropY    = 0;
+static int screenOX = 0;
+static int screenOY = 0;
+static int drawW    = SCREEN_W;
+static int drawH    = SCREEN_H;
+
+/* ── Read CST816S touch state (true = finger touching) ───────────────── */
+bool isTouched() {
+    Wire.beginTransmission(TOUCH_ADDR);
+    Wire.write(0x02);  // Register: number of touch points
+    if (Wire.endTransmission() != 0) return false;
+    if (Wire.requestFrom((uint8_t)TOUCH_ADDR, (uint8_t)1) != 1) return false;
+    uint8_t numPoints = Wire.read();
+    return (numPoints > 0 && numPoints <= 5);
+}
+
+/* ── Send control command to Camera ──────────────────────────────────── */
+void sendCtrlCommand(const char *cmd) {
+    if (ctrl_sock < 0) return;
+    sendto(ctrl_sock, cmd, 4, 0,
+           (struct sockaddr *)&ctrl_dest, sizeof(ctrl_dest));
+}
+
+/* ── Draw idle screen (camera off) ───────────────────────────────────── */
+void drawIdleScreen() {
+    gfx->fillScreen(0x0000);
+    gfx->setTextColor(0xFFFF);
+    gfx->setTextSize(2);
+
+    // Center "Appuyez" on screen
+    const char *line1 = "Appuyez pour";
+    const char *line2 = "activer la camera";
+    int16_t x1, y1;
+    uint16_t tw, th;
+    gfx->getTextBounds(line1, 0, 0, &x1, &y1, &tw, &th);
+    gfx->setCursor((SCREEN_W - tw) / 2, SCREEN_H / 2 - th - 4);
+    gfx->print(line1);
+    gfx->getTextBounds(line2, 0, 0, &x1, &y1, &tw, &th);
+    gfx->setCursor((SCREEN_W - tw) / 2, SCREEN_H / 2 + 4);
+    gfx->print(line2);
+
+    idleScreenDrawn = true;
+    screenBlank = false;
+}
 
 /* ── JPEGDEC draw callback — writes to screenBuf (fast memcpy) ───── */
 static int jpegDrawCallback(JPEGDRAW *pDraw) {
@@ -134,91 +168,6 @@ static int jpegDrawCallback(JPEGDRAW *pDraw) {
     return 1;
 }
 
-/* -- CST816S I2C read helper ------------------------------------------------- */
-static uint8_t touchReadReg(uint8_t reg) {
-    Wire.beginTransmission(CST816S_ADDR);
-    Wire.write(reg);
-    if (Wire.endTransmission(false) != 0) return 0;
-    Wire.requestFrom((uint8_t)CST816S_ADDR, (uint8_t)1);
-    return Wire.available() ? Wire.read() : 0;
-}
-
-static void touchWriteReg(uint8_t reg, uint8_t val) {
-    Wire.beginTransmission(CST816S_ADDR);
-    Wire.write(reg);
-    Wire.write(val);
-    Wire.endTransmission();
-}
-
-/* -- Init touch controller -------------------------------------------------- */
-void touchInit() {
-    Wire.begin(TOUCH_SDA, TOUCH_SCL);
-    delay(50);
-    // Disable auto-sleep so touch stays responsive
-    touchWriteReg(0xFE, 0x01);
-    delay(10);
-    uint8_t chipId = touchReadReg(0xA7);
-    Serial.printf("[TOUCH] CST816S init -- ChipID: 0x%02X\n", chipId);
-}
-
-/* -- Poll touch gesture (returns true on single tap) ------------------------ */
-static bool lastFingerDown = false;
-
-bool touchTapped() {
-    uint8_t gesture = touchReadReg(TOUCH_REG_GESTURE);
-    uint8_t fingers = touchReadReg(0x02);  // FingerNum register
-
-    bool fingerDown = (fingers > 0);
-
-    // Detect rising edge: finger was up, now down with SINGLE_CLICK gesture
-    if (fingerDown && !lastFingerDown && gesture == GESTURE_SINGLE_CLICK) {
-        lastFingerDown = true;
-        unsigned long now = millis();
-        if (now - lastTouchTime > TOUCH_COOLDOWN_MS) {
-            lastTouchTime = now;
-            return true;
-        }
-    }
-
-    if (!fingerDown) {
-        lastFingerDown = false;
-    }
-
-    return false;
-}
-
-/* -- Send control command to Camera ----------------------------------------- */
-void sendControlCommand(const char *cmd) {
-    if (ctrl_sock < 0) return;
-    struct sockaddr_in dest;
-    memset(&dest, 0, sizeof(dest));
-    dest.sin_family = AF_INET;
-    dest.sin_port = htons(CTRL_PORT);
-    inet_pton(AF_INET, CAMERA_IP, &dest.sin_addr);
-    sendto(ctrl_sock, cmd, 4, 0, (struct sockaddr *)&dest, sizeof(dest));
-    Serial.printf("[CTRL] Sent: %s\n", cmd);
-}
-
-/* -- Draw idle screen ------------------------------------------------------- */
-void drawIdleScreen() {
-    gfx->fillScreen(0x0000);
-    gfx->setTextColor(0xFFFF);
-    gfx->setTextSize(2);
-    int16_t x1, y1;
-    uint16_t tw, th;
-    const char *line1 = "Appuyez pour";
-    const char *line2 = "activer";
-    gfx->getTextBounds(line1, 0, 0, &x1, &y1, &tw, &th);
-    gfx->setCursor((SCREEN_W - tw) / 2, SCREEN_H / 2 - th - 4);
-    gfx->print(line1);
-    gfx->getTextBounds(line2, 0, 0, &x1, &y1, &tw, &th);
-    gfx->setCursor((SCREEN_W - tw) / 2, SCREEN_H / 2 + 4);
-    gfx->print(line2);
-    screenBlank = false;
-    idleScreenDrawn = true;
-    Serial.println("[UI] Idle screen displayed");
-}
-
 /* ── Connect to Camera SoftAP ────────────────────────────────────────── */
 void connectToCamera() {
     WiFi.mode(WIFI_STA);
@@ -250,7 +199,6 @@ void processPacket(uint8_t *data, size_t len) {
 
     if (chunkSize > CHUNK_PAYLOAD || chunkSize + HEADER_SIZE > len) return;
 
-    // New frame detected — reset receiver state
     if (frameId != currentFrameId) {
         currentFrameId = frameId;
         expectedChunks = totalChunks;
@@ -267,12 +215,10 @@ void processPacket(uint8_t *data, size_t len) {
     if (endPos > recvFrameLen) recvFrameLen = endPos;
     receivedChunks++;
 
-    // Frame complete — publish to triple buffer
     if (receivedChunks == expectedChunks) {
         xSemaphoreTake(tbMutex, portMAX_DELAY);
         tbReady    = tbWrite;
         tbReadyLen = recvFrameLen;
-        // Pick next write slot (not ready, not display)
         for (int i = 0; i < 3; i++) {
             if (i != tbReady && i != tbDisplay) { tbWrite = i; break; }
         }
@@ -288,7 +234,7 @@ void processPacket(uint8_t *data, size_t len) {
 void udpRecvTask(void *pvParameters) {
     uint8_t buf[HEADER_SIZE + CHUNK_PAYLOAD];
     while (true) {
-        int len = recvfrom(udp_sock, buf, sizeof(buf), 0, NULL, NULL); // blocking
+        int len = recvfrom(udp_sock, buf, sizeof(buf), 0, NULL, NULL);
         if (len > 0) processPacket(buf, len);
     }
 }
@@ -327,7 +273,6 @@ void decodeAndDisplay(int bufIdx, size_t len) {
     int imgW = jpeg.getWidth();
     int imgH = jpeg.getHeight();
 
-    // Compute crop + centering
     if (imgW >= SCREEN_W) {
         cropX    = (imgW - SCREEN_W) / 2;
         screenOX = 0;
@@ -353,11 +298,10 @@ void decodeAndDisplay(int bufIdx, size_t len) {
 
     releaseDisplayBuffer();
 
-    // One batch draw — the entire 360×360 screen in one QSPI transfer
     gfx->draw16bitRGBBitmap(0, 0, screenBuf, SCREEN_W, SCREEN_H);
 
     if (screenBlank) screenBlank = false;
-    if (idleScreenDrawn) idleScreenDrawn = false;
+    idleScreenDrawn = false;
 }
 
 /* ── Setup ───────────────────────────────────────────────────────────── */
@@ -374,7 +318,6 @@ void setup() {
             while (true) delay(1000);
         }
     }
-    // Screen buffer: 360×360 × 2 bytes = 259,200 bytes in PSRAM
     screenBuf = (uint16_t *)heap_caps_malloc(SCREEN_W * SCREEN_H * 2, MALLOC_CAP_SPIRAM);
     if (!screenBuf) {
         Serial.println("[FATAL] Screen buffer alloc failed");
@@ -395,11 +338,16 @@ void setup() {
     digitalWrite(TFT_BL, HIGH);
     Serial.println("[GFX] Display OK");
 
+    // Touch controller init (CST816S on I2C 0x15)
+    Wire.begin(TOUCH_SDA, TOUCH_SCL);
+    delay(50);
+    Serial.println("[TOUCH] CST816S init on SDA=7, SCL=8");
+
     // Connect to Camera AP
     connectToCamera();
     WiFi.setSleep(false);
 
-    // Create raw lwip UDP socket (blocking mode for recv task)
+    // Video UDP socket (blocking mode for recv task)
     udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (udp_sock < 0) {
         Serial.println("[FATAL] UDP socket creation failed");
@@ -416,67 +364,68 @@ void setup() {
         while (true) delay(1000);
     }
 
-    // Increase receive buffer
     int rcvbuf = 65536;
     setsockopt(udp_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    Serial.printf("[UDP] Video listening on port %d\n", UDP_PORT);
 
-    Serial.printf("[UDP] Listening on port %d (blocking)\n", UDP_PORT);
+    // Control UDP socket (for sending STRT/STOP to Camera)
+    ctrl_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (ctrl_sock < 0) {
+        Serial.println("[WARN] Control socket creation failed");
+    }
+    memset(&ctrl_dest, 0, sizeof(ctrl_dest));
+    ctrl_dest.sin_family = AF_INET;
+    ctrl_dest.sin_port = htons(CTRL_PORT);
+    ctrl_dest.sin_addr.s_addr = inet_addr("192.168.4.1");
+    Serial.printf("[CTRL] Control socket → 192.168.4.1:%d\n", CTRL_PORT);
 
-    // Launch UDP recv task on core 0, high priority
+    // Launch UDP recv task on core 0
     xTaskCreatePinnedToCore(udpRecvTask, "udpRecv", 4096, NULL, 2, NULL, 0);
     Serial.println("[RECV] UDP recv task started on core 0");
 
     lastFrameTime = millis();
 
-    // Init touch controller (CST816S on I2C: SDA=7, SCL=8)
-    touchInit();
-
-    // Create control UDP socket (non-blocking, for sending commands)
-    ctrl_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (ctrl_sock < 0) {
-        Serial.println("[WARN] Control socket creation failed");
-    } else {
-        Serial.printf("[CTRL] Control socket ready (target: %s:%d)\n", CAMERA_IP, CTRL_PORT);
-    }
-
-    // Show idle screen (streaming is off by default)
+    // Draw idle screen on startup
     drawIdleScreen();
+    Serial.println("[UI] Idle screen — touch to activate");
 }
 
-/* -- Loop (core 1) -- touch polling + decode + display ---------------------- */
+/* ── Loop (core 1) — touch + decode + display ────────────────────────── */
 static unsigned long dispFrames = 0;
 static unsigned long dispT0 = 0;
-static unsigned long lastTouchPoll = 0;
 
 void loop() {
     unsigned long now = millis();
 
-    // Poll touch at regular intervals
-    if (now - lastTouchPoll >= TOUCH_POLL_MS) {
-        lastTouchPoll = now;
-        if (touchTapped()) {
-            streamingActive = !streamingActive;
-            if (streamingActive) {
-                sendControlCommand("STRT");
-                lastHeartbeatTime = now;
-                idleScreenDrawn = false;
-                Serial.println("[STATE] Streaming ON");
-            } else {
-                sendControlCommand("STOP");
-                drawIdleScreen();
-                Serial.println("[STATE] Streaming OFF");
-            }
+    // ── Touch polling with edge detection (released = toggle) ────────
+    bool touchedNow = isTouched();
+    if (touchedPrev && !touchedNow && (now - lastToggleMs > TOUCH_DEBOUNCE_MS)) {
+        // Finger just released → toggle
+        streamActive = !streamActive;
+        lastToggleMs = now;
+
+        if (streamActive) {
+            sendCtrlCommand("STRT");
+            lastCtrlSendMs = now;
+            Serial.println("[TOUCH] Activated → STRT sent");
+        } else {
+            sendCtrlCommand("STOP");
+            lastCtrlSendMs = now;
+            Serial.println("[TOUCH] Deactivated → STOP sent");
+            // Draw idle screen after short delay to let last frame clear
+            drawIdleScreen();
         }
     }
+    touchedPrev = touchedNow;
 
-    // Heartbeat: re-send STRT every 2s while streaming is active
-    if (streamingActive && (now - lastHeartbeatTime >= HEARTBEAT_MS)) {
-        sendControlCommand("STRT");
-        lastHeartbeatTime = now;
+    // ── Heartbeat: resend STRT every 2s while active ─────────────────
+    if (streamActive && (now - lastCtrlSendMs >= CTRL_RESEND_MS)) {
+        sendCtrlCommand("STRT");
+        lastCtrlSendMs = now;
     }
 
-    if (streamingActive) {
-        // Decode and display incoming frames
+    // ── Display frames only when streaming is active ─────────────────
+    if (streamActive) {
         size_t len;
         int idx = grabReadyFrame(&len);
 
@@ -484,25 +433,31 @@ void loop() {
             decodeAndDisplay(idx, len);
 
             dispFrames++;
-            if (dispFrames == 1) dispT0 = millis();
+            if (dispFrames == 1) dispT0 = now;
             if (dispFrames % 60 == 0) {
-                float fps = dispFrames * 1000.0f / (millis() - dispT0);
+                float fps = dispFrames * 1000.0f / (now - dispT0);
                 Serial.printf("[DISPLAY] %lu frames, %.1f fps\n", dispFrames, fps);
             }
         } else {
             taskYIELD();
         }
 
-        // Timeout: show idle screen if no frame for 500ms while streaming
-        if (!idleScreenDrawn && (now - lastFrameTime > FRAME_TIMEOUT_MS)) {
+        // Timeout: show idle if no frame for 500ms while active
+        if (!screenBlank && !idleScreenDrawn &&
+            (now - lastFrameTime > FRAME_TIMEOUT_MS)) {
             drawIdleScreen();
-            Serial.println("[TIMEOUT] No frame -- idle screen shown");
+            Serial.println("[TIMEOUT] No frame – idle screen");
         }
     } else {
-        // Not streaming -- show idle screen if not already drawn
+        // Not streaming — draw idle if not already shown
         if (!idleScreenDrawn) {
             drawIdleScreen();
         }
-        delay(10);
+        // Drain any stale frames from the triple buffer
+        size_t dummyLen;
+        int idx = grabReadyFrame(&dummyLen);
+        if (idx >= 0) releaseDisplayBuffer();
+
+        delay(20);  // Save CPU when idle
     }
 }
