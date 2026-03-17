@@ -162,15 +162,28 @@ void touchInit() {
 }
 
 /* -- Poll touch gesture (returns true on single tap) ------------------------ */
+static bool lastFingerDown = false;
+
 bool touchTapped() {
     uint8_t gesture = touchReadReg(TOUCH_REG_GESTURE);
-    if (gesture == GESTURE_SINGLE_CLICK) {
+    uint8_t fingers = touchReadReg(0x02);  // FingerNum register
+
+    bool fingerDown = (fingers > 0);
+
+    // Detect rising edge: finger was up, now down with SINGLE_CLICK gesture
+    if (fingerDown && !lastFingerDown && gesture == GESTURE_SINGLE_CLICK) {
+        lastFingerDown = true;
         unsigned long now = millis();
         if (now - lastTouchTime > TOUCH_COOLDOWN_MS) {
             lastTouchTime = now;
             return true;
         }
     }
+
+    if (!fingerDown) {
+        lastFingerDown = false;
+    }
+
     return false;
 }
 
@@ -344,6 +357,7 @@ void decodeAndDisplay(int bufIdx, size_t len) {
     gfx->draw16bitRGBBitmap(0, 0, screenBuf, SCREEN_W, SCREEN_H);
 
     if (screenBlank) screenBlank = false;
+    if (idleScreenDrawn) idleScreenDrawn = false;
 }
 
 /* ── Setup ───────────────────────────────────────────────────────────── */
@@ -480,7 +494,7 @@ void loop() {
         }
 
         // Timeout: show idle screen if no frame for 500ms while streaming
-        if (!screenBlank && (now - lastFrameTime > FRAME_TIMEOUT_MS)) {
+        if (!idleScreenDrawn && (now - lastFrameTime > FRAME_TIMEOUT_MS)) {
             drawIdleScreen();
             Serial.println("[TIMEOUT] No frame -- idle screen shown");
         }
