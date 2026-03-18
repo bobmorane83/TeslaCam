@@ -18,6 +18,9 @@
 #include "lwip/netdb.h"
 #include <freertos/semphr.h>
 #include <Wire.h>
+#include <esp_now.h>
+#include <Fonts/FreeSansBold24pt7b.h>
+#include <Fonts/FreeSans9pt7b.h>
 
 /* ── Display hardware ────────────────────────────────────────────────── */
 #define SCREEN_W 360
@@ -90,6 +93,32 @@ static volatile unsigned long lastFrameTime = 0;
 static bool screenBlank = true;
 static bool firstFrameReceived = false;  // True after first frame since last STRT
 
+/* ── Bridge ESP-NOW reception ────────────────────────────────────────── */
+#define SPEED_CAN_ID        0x257   // CAN ID 599: DI_vehicleSpeed
+#define BRIDGE_HEARTBEAT_ID 0xFFF
+#define BRIDGE_TIMEOUT_MS   5000
+
+typedef struct __attribute__((packed)) {
+    uint32_t can_id;
+    uint8_t  dlc;
+    uint8_t  data[8];
+    uint32_t timestamp;
+    uint8_t  is_extended;
+} ESP_CAN_Message_t;
+
+static volatile float vehicleSpeed = 0;
+static volatile unsigned long lastBridgeMsg = 0;
+static volatile bool bridgeEverSeen = false;
+
+/* ── Connection status indicators ────────────────────────────────────── */
+#define DOT_RADIUS    6
+#define DOT_Y         20
+#define DOT_BRIDGE_X  (SCREEN_W / 2 - 25)
+#define DOT_CAMERA_X  (SCREEN_W / 2 + 25)
+
+static unsigned long lastIdleRedraw = 0;
+#define IDLE_REDRAW_MS 500
+
 /* ── Crop / center parameters ────────────────────────────────────────── */
 static int cropX    = 0;
 static int cropY    = 0;
@@ -115,23 +144,88 @@ void sendCtrlCommand(const char *cmd) {
            (struct sockaddr *)&ctrl_dest, sizeof(ctrl_dest));
 }
 
-/* ── Draw idle screen (camera off) ───────────────────────────────────── */
-void drawIdleScreen() {
-    gfx->fillScreen(0x0000);
-    gfx->setTextColor(0xFFFF);
-    gfx->setTextSize(2);
+/* ── ESP-NOW receive callback (WiFi task context) ────────────────────── */
+void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+    if ((size_t)len != sizeof(ESP_CAN_Message_t)) return;
+    const ESP_CAN_Message_t *msg = (const ESP_CAN_Message_t *)data;
 
-    // Center "Appuyez" on screen
-    const char *line1 = "Appuyez pour";
-    const char *line2 = "activer la camera";
+    lastBridgeMsg = millis();
+    bridgeEverSeen = true;
+
+    if (msg->can_id == SPEED_CAN_ID && msg->dlc >= 3) {
+        // DI_vehicleSpeed: start_bit=12, len=12, LE, unsigned, x0.08 -40 kph
+        uint16_t raw = ((msg->data[1] >> 4) & 0x0F) | ((uint16_t)msg->data[2] << 4);
+        if (raw != 4095) {                       // 4095 = SNA
+            float spd = raw * 0.08f - 40.0f;
+            vehicleSpeed = (spd > 0) ? spd : 0;
+        }
+    }
+}
+
+/* ── Initialize ESP-NOW for Bridge reception ─────────────────────────── */
+void initESPNOW() {
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("[ESP-NOW] Init failed");
+        return;
+    }
+    esp_now_register_recv_cb(onEspNowRecv);
+    Serial.println("[ESP-NOW] Initialized \u2014 listening for Bridge");
+}
+
+/* ── Draw connection status dots at top of screen ────────────────────── */
+void drawStatusDots() {
+    unsigned long now = millis();
+    bool blinkOn = (now / 500) % 2 == 0;
+
+    // Bridge status (left dot)
+    uint16_t bCol;
+    if (bridgeEverSeen && (now - lastBridgeMsg < BRIDGE_TIMEOUT_MS)) {
+        bCol = 0x07E0;                           // Green
+    } else if (!bridgeEverSeen) {
+        bCol = blinkOn ? 0xFD20 : 0x0000;        // Orange blink
+    } else {
+        bCol = 0xF800;                           // Red
+    }
+    gfx->fillCircle(DOT_BRIDGE_X, DOT_Y, DOT_RADIUS, bCol);
+
+    // Camera status (right dot)
+    uint16_t cCol = (WiFi.status() == WL_CONNECTED) ? 0x07E0 : 0xF800;
+    gfx->fillCircle(DOT_CAMERA_X, DOT_Y, DOT_RADIUS, cCol);
+}
+
+/* ── Draw speed screen (idle: camera off) ────────────────────────────── */
+void drawSpeedScreen() {
+    gfx->fillScreen(0x0000);
+
+    int speed = (int)(vehicleSpeed + 0.5f);
+    if (speed < 0) speed = 0;
+    if (speed > 999) speed = 999;
+
+    char speedStr[8];
+    snprintf(speedStr, sizeof(speedStr), "%d", speed);
+
     int16_t x1, y1;
     uint16_t tw, th;
-    gfx->getTextBounds(line1, 0, 0, &x1, &y1, &tw, &th);
-    gfx->setCursor((SCREEN_W - tw) / 2, SCREEN_H / 2 - th - 4);
-    gfx->print(line1);
-    gfx->getTextBounds(line2, 0, 0, &x1, &y1, &tw, &th);
-    gfx->setCursor((SCREEN_W - tw) / 2, SCREEN_H / 2 + 4);
-    gfx->print(line2);
+
+    // Speed number \u2014 FreeSansBold 24pt x textSize(3) \u2248 72pt
+    gfx->setFont(&FreeSansBold24pt7b);
+    gfx->setTextSize(3);
+    gfx->setTextColor(0xFFFF);
+    gfx->getTextBounds(speedStr, 0, 0, &x1, &y1, &tw, &th);
+    gfx->setCursor((SCREEN_W - tw) / 2 - x1,
+                   SCREEN_H / 2 - y1 - th / 2 - 15);
+    gfx->print(speedStr);
+
+    // "km/h" below \u2014 FreeSans 9pt x textSize(2) \u2248 18pt
+    gfx->setFont(&FreeSans9pt7b);
+    gfx->setTextSize(2);
+    gfx->setTextColor(0x7BEF);
+    gfx->getTextBounds("km/h", 0, 0, &x1, &y1, &tw, &th);
+    gfx->setCursor((SCREEN_W - tw) / 2 - x1,
+                   SCREEN_H / 2 - y1 + th / 2 + 30);
+    gfx->print("km/h");
+
+    drawStatusDots();
 
     idleScreenDrawn = true;
     screenBlank = false;
@@ -349,6 +443,9 @@ void setup() {
     connectToCamera();
     WiFi.setSleep(false);
 
+    // ESP-NOW for Bridge CAN data reception
+    initESPNOW();
+
     // Video UDP socket (blocking mode for recv task)
     udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (udp_sock < 0) {
@@ -387,9 +484,9 @@ void setup() {
 
     lastFrameTime = millis();
 
-    // Draw idle screen on startup
-    drawIdleScreen();
-    Serial.println("[UI] Idle screen — touch to activate");
+    // Draw speed screen on startup
+    drawSpeedScreen();
+    Serial.println("[UI] Speed screen — touch to activate camera");
 }
 
 /* ── Loop (core 1) — touch + decode + display ────────────────────────── */
@@ -417,8 +514,8 @@ void loop() {
             lastCtrlSendMs = now;
             firstFrameReceived = false;
             Serial.println("[TOUCH] Deactivated → STOP sent");
-            // Draw idle screen after short delay to let last frame clear
-            drawIdleScreen();
+            drawSpeedScreen();
+            lastIdleRedraw = now;
         }
     }
     touchedPrev = touchedNow;
@@ -436,6 +533,7 @@ void loop() {
 
         if (idx >= 0) {
             decodeAndDisplay(idx, len);
+            drawStatusDots();
 
             dispFrames++;
             if (dispFrames == 1) dispT0 = now;
@@ -450,9 +548,10 @@ void loop() {
         // No automatic idle screen during active streaming.
         // A frozen last frame is safer for a backup camera than flashing idle.
     } else {
-        // Not streaming — draw idle if not already shown
-        if (!idleScreenDrawn) {
-            drawIdleScreen();
+        // Not streaming — redraw speed periodically (speed updates + blink)
+        if (!idleScreenDrawn || (now - lastIdleRedraw >= IDLE_REDRAW_MS)) {
+            drawSpeedScreen();
+            lastIdleRedraw = now;
         }
         // Drain any stale frames from the triple buffer
         size_t dummyLen;

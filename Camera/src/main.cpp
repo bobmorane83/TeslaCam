@@ -104,7 +104,7 @@ bool initCamera() {
     if (s) {
         Serial.printf("[CAM] Sensor PID: 0x%04X\n", s->id.PID);
         s->set_vflip(s, 1);     // Flip vertical (caméra de recul)
-        s->set_hmirror(s, 1);   // Miroir horizontal
+        s->set_hmirror(s, 0);   // Pas de miroir horizontal
     }
     Serial.println("[CAM] Camera ready");
     return true;
@@ -116,7 +116,7 @@ bool initCamera() {
 void startSoftAP() {
     WiFi.mode(WIFI_AP);
     WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
-    WiFi.softAP(AP_SSID);
+    WiFi.softAP(AP_SSID, nullptr, 6);  // Channel 6 (matches Bridge ESP-NOW)
     Serial.printf("[WIFI] SoftAP started – SSID: %s  IP: %s\n",
                   AP_SSID, WiFi.softAPIP().toString().c_str());
 }

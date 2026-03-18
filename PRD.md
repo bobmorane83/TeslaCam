@@ -12,20 +12,31 @@ Système embarqué de caméra de recul pour Tesla composé de deux ESP32-S3 comm
 |---|---|---|
 | **Camera** | Freenove ESP32-S3 WROOM | ESP32-S3, OV5640, 8 MB PSRAM OPI, Wi-Fi 802.11n |
 | **Écran** | JC3636W518C | ESP32-S3, ST77916 QSPI, 360×360 rond, 16 MB Flash, 8 MB PSRAM OPI |
+| **Bridge** | NodeMCU-ESP32 DEVKITV1 + MCP2515 | ESP32, MCP2515 SPI CAN controller, 8 MHz crystal, bus CAN 500 kbps |
 
 ---
 
 ## 3. Architecture
 
 ```
-┌───────────────────────┐         Wi-Fi (SoftAP)        ┌───────────────────────┐
+┌───────────────────────┐         Wi-Fi (SoftAP ch.6)   ┌───────────────────────┐
 │   ESP32-S3 Camera     │ ────── UDP port 5000 ──────── │   ESP32-S3 Écran      │
 │                       │                                │                       │
-│  OV5640 (JPEG 360x360)│  Paquets UDP chunked          │  ST77916 360x360 rond │
+│  OV5640 (JPEG 360x360)│  Paquets UDP chunked          │  ST77916 360×360 rond │
 │  Mode : SoftAP        │  Header 8B + payload ≤1452B   │  Mode : Station       │
 │  IP : 192.168.4.1     │                                │  IP : 192.168.4.2     │
-│                       │                                │  LVGL + JPEGDEC       │
+│                       │                                │  JPEGDEC + GFX        │
 └───────────────────────┘                                └───────────────────────┘
+                                                                    ▲
+                                                                    │ ESP-NOW
+                                                                    │ (channel 6)
+                                                         ┌──────────┴──────────┐
+                                                         │   ESP32 Bridge      │
+                                                         │                     │
+                                                         │  MCP2515 CAN 500kbps│
+                                                         │  CAN → ESP-NOW      │
+                                                         │  Trames Tesla M3    │
+                                                         └─────────────────────┘
 ```
 
 ### Choix de communication : SoftAP + UDP raw
@@ -65,6 +76,19 @@ Basé sur l'analyse du Guide.txt, le protocole **SoftAP + UDP raw** est retenu c
 | ECR-06 | Triple buffering frames | Trois buffers JPEG en PSRAM (réception / prêt / affichage) avec mutex FreeRTOS, pour éviter les artefacts et la perte de paquets. |
 | ECR-07 | Activation/désactivation par toucher | Un appui sur l'écran tactile envoie une commande `START` à la Camera (UDP). Un second appui envoie `STOP`. L'état bascule à chaque toucher (toggle). Quand le streaming est inactif, l'écran affiche un indicateur visuel (ex: icône caméra barrée ou texte "Appuyez pour activer"). |
 | ECR-08 | Commande UDP de contrôle | Envoie les commandes `START` / `STOP` à la Camera via UDP port `5001` (port de contrôle distinct du port vidéo `5000`). |
+| ECR-09 | Réception ESP-NOW du Bridge | Reçoit les trames CAN transmises par le Bridge via ESP-NOW (broadcast, canal 6). Décode `DI_vehicleSpeed` (CAN ID 0x257) et affiche la vitesse au centre de l'écran quand la caméra est inactive. |
+| ECR-10 | Affichage vitesse | Affiche la vitesse véhicule en grand (≈ 2/3 de la largeur de l'écran) avec une police lisse (FreeSansBold 24pt × 3), en remplacement du texte "Appuyez pour activer". Unité "km/h" affichée en dessous. |
+| ECR-11 | Indicateurs de connexion | Deux points colorés en haut de l'écran indiquent l'état de connexion : **gauche** = Bridge (vert connecté, rouge déconnecté, orange clignotant en recherche), **droite** = Camera (vert connecté, rouge déconnecté). Visibles en mode idle ET en overlay sur le flux vidéo. |
+
+### 4.3 ESP32 Bridge (passerelle CAN → ESP-NOW)
+
+| ID | Exigence | Détail |
+|---|---|---|
+| BRG-01 | Lire le bus CAN Tesla | MCP2515 en mode listen-only, 500 kbps, filtres matériels sur les IDs Tesla Model 3 (159 IDs DBC). |
+| BRG-02 | Émettre via ESP-NOW | Broadcast des trames CAN sous forme de `ESP_CAN_Message_t` (18 bytes packed) à tous les peers ESP-NOW sur canal 6. |
+| BRG-03 | Heartbeat | Émet une trame heartbeat (CAN ID 0xFFF, DLC 0) toutes les 2 secondes via ESP-NOW. |
+| BRG-04 | AP auto-shutdown | Démarre un AP Wi-Fi ("bridge") pour le debug. Si aucun client après 3 min, l'AP est coupé et le Bridge passe en mode ESP-NOW seul (économie CPU). |
+| BRG-05 | Canal Wi-Fi | Utilise le canal Wi-Fi 6, partagé avec le SoftAP Camera pour permettre la réception ESP-NOW par l'Écran. |
 
 ---
 
@@ -102,6 +126,27 @@ Basé sur l'analyse du Guide.txt, le protocole **SoftAP + UDP raw** est retenu c
 - La Camera écoute sur le port `5001` en plus du port vidéo
 - Au démarrage, la Camera est en mode veille (pas de capture)
 - L'Écran réémet `STRT` périodiquement (toutes les 2s) tant que le streaming est actif, pour gérer les reconnexions
+
+### 5.3 Canal CAN / ESP-NOW — Bridge → Écran
+
+```
+┌─────────────────────────────────────────┐
+│  ESP_CAN_Message_t (18 bytes packed)    │
+│  can_id      : uint32_t  (4B, LE)      │
+│  dlc         : uint8_t   (1B)          │
+│  data[8]     : uint8_t   (8B)          │
+│  timestamp   : uint32_t  (4B, LE)      │
+│  is_extended : uint8_t   (1B)          │
+└─────────────────────────────────────────┘
+```
+
+- **Transport** : ESP-NOW broadcast (FF:FF:FF:FF:FF:FF) sur canal Wi-Fi 6
+- **Débit** : ~1000 trames CAN/s (filtré par whitelist DBC)
+- **Signal vitesse** : CAN ID `0x257` (599 déc), `DI_vehicleSpeed`
+  - Bit 12, longueur 12, little-endian, unsigned
+  - Facteur = 0.08, Offset = −40, Unité = kph
+  - Valeur SNA = 4095
+- **Heartbeat** : CAN ID `0xFFF`, DLC=0, toutes les 2s
 
 ---
 
@@ -154,7 +199,18 @@ s->set_hmirror(s, 1);                  // Miroir horizontal
 | Display driver | Arduino_GFX (ST77916 QSPI) |
 | Décodage JPEG | JPEGDEC (bitbank2) |
 | Wi-Fi | Mode Station |
-| Transport | AsyncUDP (écoute port 5000) |
+| ESP-NOW | Réception trames Bridge (canal 6) |
+| Transport | lwip UDP raw (ports 5000, 5001) |
+
+### Bridge (`bridge/`)
+
+| Composant | Choix |
+|---|---|
+| Framework | Arduino (espressif32) |
+| Platform | espressif32 (PlatformIO) |
+| CAN | MCP2515 via mcp_can (SPI) |
+| Wi-Fi | AP mode (debug) puis STA mode (ESP-NOW only) |
+| ESP-NOW | Broadcast trames CAN filtrées |
 
 ### Dépendances à ajouter
 
@@ -198,6 +254,14 @@ lib_deps =
 - [x] **Écran** : Implémenter le toggle START/STOP avec envoi de commande UDP sur port 5001
 - [x] **Écran** : Afficher un écran d'attente quand le streaming est inactif ("Appuyez pour activer")
 - [x] **Camera** : Écouter le port 5001 pour les commandes de contrôle
+
+### Phase 5 — Intégration Bridge CAN
+- [ ] **Camera** : Configurer le SoftAP sur canal Wi-Fi 6 (alignement avec Bridge ESP-NOW)
+- [ ] **Écran** : Initialiser ESP-NOW après connexion Wi-Fi pour recevoir les broadcasts du Bridge
+- [ ] **Écran** : Décoder `DI_vehicleSpeed` (CAN ID 0x257) depuis les trames ESP-NOW
+- [ ] **Écran** : Afficher la vitesse véhicule au centre de l'écran idle (FreeSansBold 24pt × 3, ~2/3 largeur)
+- [ ] **Écran** : Ajouter deux indicateurs de connexion (points colorés) en haut de l'écran (Bridge + Camera)
+- [ ] **Écran** : Afficher les indicateurs en overlay sur le flux vidéo pendant le streaming
 - [x] **Camera** : Ne capturer et émettre que lorsque la commande START a été reçue
 - [x] **Camera** : Couper la capture (et réduire la consommation) sur commande STOP
 

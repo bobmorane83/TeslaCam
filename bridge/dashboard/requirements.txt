@@ -1,0 +1,5 @@
+dash>=2.14.0
+dash-bootstrap-components>=1.5.0
+plotly>=5.18.0
+cantools>=39.0.0
+python-can>=4.3.0
