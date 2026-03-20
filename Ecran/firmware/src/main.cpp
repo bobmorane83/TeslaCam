@@ -1,28 +1,26 @@
 /*
  * TeslaCam -- ESP32-S3 Display (JC3636W518C, ST77916, 360x360 round)
- * Wi-Fi Station + UDP receiver -- decodes JPEG and displays on screen.
- * Dashboard with CAN data from Bridge via ESP-NOW.
+ * LVGL-based dashboard with CAN data from Bridge via ESP-NOW.
+ * Camera stream via direct JPEG decode (bypasses LVGL).
  *
  * Architecture:
- *   Core 0: UDP recv task (high priority, blocking recv, never misses packets)
- *   Core 1: Main loop -- touch polling, dashboard render or JPEG decode + display
- *
- * Touch toggles between dashboard (with CAN data) and camera stream.
- * Camera is in sleep mode by default -- only captures on STRT command.
+ *   Core 0: UDP recv task (high priority, blocking recv)
+ *   Core 1: Main loop -- LVGL timer handler, touch, dashboard / camera
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <Arduino_GFX_Library.h>
 #include <JPEGDEC.h>
+#include <lvgl.h>
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include <freertos/semphr.h>
 #include <Wire.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
-#include <Fonts/FreeSansBold24pt7b.h>
-#include <Fonts/FreeSans9pt7b.h>
+
+LV_FONT_DECLARE(font_montserrat_72);
 
 /* ======================================================================
  *  DISPLAY HARDWARE
@@ -71,7 +69,6 @@ static bool touchedPrev       = false;
 static unsigned long lastToggleMs = 0;
 static bool streamActive      = false;
 static unsigned long lastCtrlSendMs = 0;
-static bool idleScreenDrawn   = false;
 static bool wifiConnected     = false;
 static bool networkReady      = false;
 
@@ -86,11 +83,9 @@ static uint16_t currentFrameId = 0, expectedChunks = 0, receivedChunks = 0;
 static size_t recvFrameLen = 0;
 
 /* ======================================================================
- *  SCREEN BUFFERS
+ *  SCREEN BUFFERS (for camera JPEG mode)
  * ====================================================================== */
-static uint16_t *screenBuf;   // 360x360 working buffer (PSRAM)
-static uint16_t *bezelBuf;    // 360x360 pre-rendered static bezel (PSRAM)
-
+static uint16_t *screenBuf;   // 360x360 for JPEG decode
 static volatile unsigned long lastFrameTime = 0;
 #define FRAME_TIMEOUT_MS 2000
 static bool screenBlank = true;
@@ -110,13 +105,13 @@ typedef struct __attribute__((packed)) {
     uint8_t  is_extended;
 } ESP_CAN_Message_t;
 
-#define CAN_ID_SPEED     0x257   // DI_uiSpeed
-#define CAN_ID_GEAR      0x118   // DI_gear
-#define CAN_ID_RANGE_SOC 0x33A   // UI_Range, UI_SOC
-#define CAN_ID_BATT_TEMP 0x312   // BMSmaxPackTemperature
-#define CAN_ID_REAR_PWR  0x266   // RearPower266
-#define CAN_ID_FRONT_PWR 0x2E5   // FrontPower2E5
-#define CAN_ID_BMS_SOC   0x292   // SOCUI292
+#define CAN_ID_SPEED     0x257
+#define CAN_ID_GEAR      0x118
+#define CAN_ID_RANGE_SOC 0x33A
+#define CAN_ID_BATT_TEMP 0x312
+#define CAN_ID_REAR_PWR  0x266
+#define CAN_ID_FRONT_PWR 0x2E5
+#define CAN_ID_BMS_SOC   0x292
 #define CAN_ID_HEARTBEAT 0xFFF
 
 #define GEAR_INVALID 0
@@ -144,20 +139,38 @@ static float regenKwSmooth = 0;
 #define MAX_REGEN_KW 50.0f
 
 /* ======================================================================
- *  COLOR PALETTE (RGB565)
+ *  LVGL DISPLAY DRIVER
  * ====================================================================== */
-#define COL_BG        0x0000
-#define COL_TEAL      0x0738   // #00e5c8
-#define COL_TEAL_DIM  0x02B2
-#define COL_TEAL_VDIM 0x0151
-#define COL_AMBER     0xFD40   // #ffaa00
-#define COL_RED       0xF9A6   // #ff3b3b
-#define COL_BLUE      0x1C7F   // #1a8fff
-#define COL_WHITE     0xFFFF
-#define COL_TEXTDIM   0x3B0E   // #3a5a70
-#define COL_GREEN     0x07E0
+static lv_disp_draw_buf_t lvDrawBuf;
+static lv_disp_drv_t      lvDispDrv;
+static lv_indev_drv_t     lvTouchDrv;
+#define LV_BUF_LINES 40
+static lv_color_t *lvBuf1;
+static lv_color_t *lvBuf2;
 
-static uint16_t speedColor(int speed) {
+static void lvFlushCb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *buf) {
+    uint32_t w = area->x2 - area->x1 + 1;
+    uint32_t h = area->y2 - area->y1 + 1;
+    gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t *)buf, w, h);
+    lv_disp_flush_ready(drv);
+}
+
+/* ======================================================================
+ *  LVGL COLORS (lv_color_t palette)
+ * ====================================================================== */
+#define MKCOL(r,g,b) lv_color_make(r,g,b)
+static const lv_color_t COL_BG       = MKCOL(5, 10, 15);
+static const lv_color_t COL_TEAL     = MKCOL(0, 229, 200);
+static const lv_color_t COL_TEAL_DIM = MKCOL(0, 90, 80);
+static const lv_color_t COL_TEAL_VDIM= MKCOL(0, 42, 38);
+static const lv_color_t COL_AMBER    = MKCOL(255, 170, 0);
+static const lv_color_t COL_RED      = MKCOL(255, 59, 59);
+static const lv_color_t COL_BLUE     = MKCOL(26, 143, 255);
+static const lv_color_t COL_WHITE    = MKCOL(255, 255, 255);
+static const lv_color_t COL_TEXTDIM  = MKCOL(58, 90, 112);
+static const lv_color_t COL_GREEN    = MKCOL(0, 255, 0);
+
+static lv_color_t lvSpeedColor(int speed) {
     float t = speed / 180.0f;
     if (t > 1.0f) t = 1.0f;
     uint8_t r, g, b;
@@ -172,380 +185,450 @@ static uint16_t speedColor(int speed) {
         g = (uint8_t)((1.0f - f) * 200);
         b = 0;
     }
-    return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+    return lv_color_make(r, g, b);
 }
 
-static uint16_t socColor(uint8_t soc) {
+static lv_color_t lvSocColor(uint8_t soc) {
     if (soc > 50) return COL_TEAL;
     if (soc > 20) return COL_AMBER;
     return COL_RED;
 }
 
-static uint16_t tempColor(float t) {
+static lv_color_t lvTempColor(float t) {
     if (t < 20.0f) return COL_BLUE;
     if (t < 42.0f) return COL_AMBER;
     return COL_RED;
 }
 
 /* ======================================================================
- *  SCREEN BUFFER DRAWING PRIMITIVES
+ *  LVGL DASHBOARD WIDGETS
  * ====================================================================== */
-static inline void bufPixel(int x, int y, uint16_t c) {
-    if ((unsigned)x < SCREEN_W && (unsigned)y < SCREEN_H)
-        screenBuf[y * SCREEN_W + x] = c;
-}
+/* Speed arc (outer, 270° sweep) */
+static lv_obj_t *arcSpeed;
+static lv_obj_t *arcSpeedTrack; // background ring (using a second arc for the dim track)
 
-static void bufFillRect(int x, int y, int w, int h, uint16_t c) {
-    int x0 = max(x, 0), y0 = max(y, 0);
-    int x1 = min(x + w, SCREEN_W), y1 = min(y + h, SCREEN_H);
-    for (int j = y0; j < y1; j++)
-        for (int i = x0; i < x1; i++)
-            screenBuf[j * SCREEN_W + i] = c;
-}
+/* Battery arc (inner, 244° sweep) */
+static lv_obj_t *arcBatt;
 
-static void bufFillCircle(int cx, int cy, int r, uint16_t c) {
-    int r2 = r * r;
-    for (int dy = -r; dy <= r; dy++) {
-        int dx = (int)sqrtf((float)(r2 - dy * dy));
-        int y = cy + dy;
-        if ((unsigned)y >= SCREEN_H) continue;
-        int x0 = max(cx - dx, 0);
-        int x1 = min(cx + dx, SCREEN_W - 1);
-        for (int x = x0; x <= x1; x++)
-            screenBuf[y * SCREEN_W + x] = c;
-    }
-}
+/* Labels */
+static lv_obj_t *lblSpeed;
+static lv_obj_t *lblSpeedUnit;
+static lv_obj_t *lblRange;
+static lv_obj_t *lblRangeUnit;
+static lv_obj_t *lblRangeLbl;
+static lv_obj_t *lblTemp;
+static lv_obj_t *lblTempUnit;
+static lv_obj_t *lblTempLbl;
+static lv_obj_t *lblSoc;
+static lv_obj_t *lblSocLbl;
+static lv_obj_t *lblRegenLbl;
+static lv_obj_t *lblRegenKw;
 
-/* Draw a thick arc (ring segment) from angle a0 to a1 (radians) */
-static void bufFillArc(int cx, int cy, int ri, int ro, float a0, float a1, uint16_t c) {
-    if (a1 < a0) a1 += 2.0f * M_PI;
-    int ri2 = ri * ri, ro2 = ro * ro;
-    for (int y = cy - ro - 1; y <= cy + ro + 1; y++) {
-        if ((unsigned)y >= SCREEN_H) continue;
-        for (int x = cx - ro - 1; x <= cx + ro + 1; x++) {
-            if ((unsigned)x >= SCREEN_W) continue;
-            int dx = x - cx, dy = y - cy;
-            int d2 = dx * dx + dy * dy;
-            if (d2 < ri2 || d2 > ro2) continue;
-            float a = atan2f((float)dy, (float)dx);
-            if (a < a0) a += 2.0f * M_PI;
-            if (a >= a0 && a <= a1)
-                screenBuf[y * SCREEN_W + x] = c;
-        }
-    }
-}
+/* Regen bar */
+static lv_obj_t *barRegen;
 
-/* Bresenham line */
-static void bufDrawLine(int x0, int y0, int x1, int y1, uint16_t c) {
-    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
-    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy;
-    while (true) {
-        bufPixel(x0, y0, c);
-        if (x0 == x1 && y0 == y1) break;
-        int e2 = 2 * err;
-        if (e2 >= dy) { err += dy; x0 += sx; }
-        if (e2 <= dx) { err += dx; y0 += sy; }
-    }
-}
+/* Gear indicator (single) */
+static lv_obj_t *gearBox;
+static lv_obj_t *gearLabel;
+
+/* Connection dots */
+static lv_obj_t *dotBridge;
+static lv_obj_t *dotCamera;
+
+/* Speed tick lines drawn on a dedicated object */
+static lv_obj_t *tickCanvas;
+
+/* ── Speed arc angles ── */
+/* LVGL arcs: 0° = right (3 o'clock), CW.
+ * Mockup speed: starts at 135° (bottom-left) → 405° (bottom-right) = 270° sweep.
+ * LVGL arc convention: bg_start_angle / bg_end_angle in degrees CW from right.
+ * For 270° sweep from 135° to 405°: start=135, end=405 → but LVGL wraps at 360.
+ * LVGL handles angles > 360 correctly for arcs. */
+#define SPEED_ARC_START 135
+#define SPEED_ARC_END   45     // 405 - 360 = 45 (LVGL wraps)
+#define SPEED_ARC_RANGE 270
+#define SPEED_R_OUTER   158    // outer radius of speed arc
+#define SPEED_ARC_WIDTH 6
+
+/* Battery: 148° → 392° = 244° sweep */
+#define BATT_ARC_START  148
+#define BATT_ARC_END    32     // 392 - 360 = 32
+#define BATT_ARC_RANGE  244
+#define BATT_R_OUTER    121
+#define BATT_ARC_WIDTH  4
 
 /* ======================================================================
- *  GFXfont TEXT RENDERER (draws into screenBuf)
+ *  TICK MARK DRAWING (event callback on a transparent obj)
  * ====================================================================== */
-static void bufDrawChar(int cx, int cy, char ch, const GFXfont *font, uint8_t sz, uint16_t col) {
-    if (ch < (char)font->first || ch > (char)font->last) return;
-    GFXglyph *g = &font->glyph[ch - font->first];
-    uint8_t *bmp = font->bitmap;
-    uint16_t bo = g->bitmapOffset;
-    uint8_t w = g->width, h = g->height;
-    int8_t xo = g->xOffset, yo = g->yOffset;
-    uint8_t bit = 0, bits = 0;
-    for (uint8_t yy = 0; yy < h; yy++) {
-        for (uint8_t xx = 0; xx < w; xx++) {
-            if (!(bit++ & 7)) bits = pgm_read_byte(&bmp[bo++]);
-            if (bits & 0x80) {
-                if (sz == 1) {
-                    bufPixel(cx + xo + xx, cy + yo + yy, col);
-                } else {
-                    bufFillRect(cx + (xo + xx) * sz, cy + (yo + yy) * sz, sz, sz, col);
-                }
-            }
-            bits <<= 1;
-        }
-    }
-}
+static void drawTicksCb(lv_event_t *e) {
+    lv_obj_t *obj = lv_event_get_target(e);
+    lv_draw_ctx_t *draw_ctx = lv_event_get_draw_ctx(e);
 
-static int bufTextWidth(const char *s, const GFXfont *font, uint8_t sz) {
-    int w = 0;
-    while (*s) {
-        if (*s >= (char)font->first && *s <= (char)font->last) {
-            GFXglyph *g = &font->glyph[*s - font->first];
-            w += g->xAdvance * sz;
-        }
-        s++;
-    }
-    return w;
-}
+    lv_area_t obj_coords;
+    lv_obj_get_coords(obj, &obj_coords);
 
-static void bufDrawTextCentered(int cx, int cy, const char *s, const GFXfont *font, uint8_t sz, uint16_t col) {
-    int tw = bufTextWidth(s, font, sz);
-    int x = cx - tw / 2;
-    while (*s) {
-        if (*s >= (char)font->first && *s <= (char)font->last) {
-            GFXglyph *g = &font->glyph[*s - font->first];
-            bufDrawChar(x, cy, *s, font, sz, col);
-            x += g->xAdvance * sz;
-        }
-        s++;
-    }
-}
+    int cx = (obj_coords.x1 + obj_coords.x2) / 2;
+    int cy = (obj_coords.y1 + obj_coords.y2) / 2;
 
-static void bufDrawTextRight(int rx, int y, const char *s, const GFXfont *f, uint8_t sz, uint16_t c) {
-    int tw = bufTextWidth(s, f, sz);
-    int x = rx - tw;
-    while (*s) {
-        if (*s >= (char)f->first && *s <= (char)f->last) {
-            GFXglyph *g = &f->glyph[*s - f->first];
-            bufDrawChar(x, y, *s, f, sz, c);
-            x += g->xAdvance * sz;
-        }
-        s++;
-    }
-}
-
-static void bufDrawText(int lx, int y, const char *s, const GFXfont *f, uint8_t sz, uint16_t c) {
-    int x = lx;
-    while (*s) {
-        if (*s >= (char)f->first && *s <= (char)f->last) {
-            GFXglyph *g = &f->glyph[*s - f->first];
-            bufDrawChar(x, y, *s, f, sz, c);
-            x += g->xAdvance * sz;
-        }
-        s++;
-    }
-}
-
-/* ======================================================================
- *  BEZEL RENDERING (static elements, drawn once at startup)
- * ====================================================================== */
-/* Speed arc: 135 deg CW to 405 deg (bottom-left to bottom-right, 270 deg sweep) */
-#define SPEED_ANG_START  (135.0f * M_PI / 180.0f)
-#define SPEED_ANG_END    (405.0f * M_PI / 180.0f)
-#define SPEED_ANG_RANGE  (270.0f * M_PI / 180.0f)
-
-/* Battery arc: 148 deg to 392 deg (bottom portion, 244 deg sweep) */
-#define BATT_ANG_START   (148.0f * M_PI / 180.0f)
-#define BATT_ANG_END     (392.0f * M_PI / 180.0f)
-#define BATT_ANG_RANGE   (BATT_ANG_END - BATT_ANG_START)
-
-#define SPEED_R_TICK     168  // Tick outer radius
-#define SPEED_R_ARC_OUT  158  // Speed arc outer
-#define SPEED_R_ARC_IN   152  // Speed arc inner
-#define BATT_R_ARC_OUT   121  // Battery arc outer
-#define BATT_R_ARC_IN    117  // Battery arc inner
-#define SPEED_R_NUM      128  // Number label radius
-
-static void renderBezel() {
-    memset(bezelBuf, 0, SCREEN_W * SCREEN_H * 2);
-    uint16_t *savedBuf = screenBuf;
-    screenBuf = bezelBuf;
-
-    // Speed tick marks: 37 ticks (0..36), every 5 km/h, major every 20
     int numTicks = 36;
+    float startA = 135.0f * M_PI / 180.0f;
+    float rangeA = 270.0f * M_PI / 180.0f;
+    int rO = 172;
+
     for (int i = 0; i <= numTicks; i++) {
-        float a = SPEED_ANG_START + ((float)i / numTicks) * SPEED_ANG_RANGE;
-        bool major = (i % 4 == 0);   // Every 4 ticks = 20 km/h
-        int len = major ? 16 : 7;
-        int rO = SPEED_R_TICK;
-        int x0 = CX + (int)(rO * cosf(a));
-        int y0 = CY + (int)(rO * sinf(a));
-        int x1 = CX + (int)((rO - len) * cosf(a));
-        int y1 = CY + (int)((rO - len) * sinf(a));
-        uint16_t col = major ? COL_TEAL_DIM : COL_TEAL_VDIM;
-        bufDrawLine(x0, y0, x1, y1, col);
+        float a = startA + ((float)i / numTicks) * rangeA;
+        bool major = (i % 4 == 0);
+        int len = major ? 18 : 8;
+
+        lv_point_t pts[2];
+        pts[0].x = cx + (int)(rO * cosf(a));
+        pts[0].y = cy + (int)(rO * sinf(a));
+        pts[1].x = cx + (int)((rO - len) * cosf(a));
+        pts[1].y = cy + (int)((rO - len) * sinf(a));
+
+        lv_draw_line_dsc_t ldsc;
+        lv_draw_line_dsc_init(&ldsc);
+        ldsc.color = major ? COL_TEAL_DIM : COL_TEAL_VDIM;
+        ldsc.width = major ? 2 : 1;
+        ldsc.opa = LV_OPA_COVER;
+        lv_draw_line(draw_ctx, &ldsc, &pts[0], &pts[1]);
 
         if (major) {
             int spd = (int)(((float)i / numTicks) * 180 + 0.5f);
             char buf[4];
             snprintf(buf, sizeof(buf), "%d", spd);
-            int rL = SPEED_R_NUM;
-            int tx = CX + (int)(rL * cosf(a));
-            int ty = CY + (int)(rL * sinf(a));
-            int tw = bufTextWidth(buf, &FreeSans9pt7b, 1);
-            bufDrawText(tx - tw / 2, ty + 5, buf, &FreeSans9pt7b, 1, COL_TEAL_DIM);
+            int rL = rO - 34;
+            int tx = cx + (int)(rL * cosf(a));
+            int ty = cy + (int)(rL * sinf(a));
+
+            lv_draw_label_dsc_t lbdsc;
+            lv_draw_label_dsc_init(&lbdsc);
+            lbdsc.color = COL_TEAL_DIM;
+            lbdsc.font = &lv_font_montserrat_12;
+            lbdsc.opa = LV_OPA_COVER;
+            lbdsc.align = LV_TEXT_ALIGN_CENTER;
+
+            lv_area_t txt_area;
+            lv_point_t txt_size;
+            lv_txt_get_size(&txt_size, buf, lbdsc.font, 0, 0, 200, LV_TEXT_FLAG_NONE);
+            txt_area.x1 = tx - txt_size.x / 2;
+            txt_area.y1 = ty - txt_size.y / 2;
+            txt_area.x2 = txt_area.x1 + txt_size.x - 1;
+            txt_area.y2 = txt_area.y1 + txt_size.y - 1;
+            lv_draw_label(draw_ctx, &lbdsc, &txt_area, buf, NULL);
         }
     }
-
-    // Speed arc track (very dim ring)
-    bufFillArc(CX, CY, SPEED_R_ARC_IN, SPEED_R_ARC_OUT, SPEED_ANG_START, SPEED_ANG_END, COL_TEAL_VDIM);
-
-    // Battery arc track (very dim ring)
-    bufFillArc(CX, CY, BATT_R_ARC_IN, BATT_R_ARC_OUT, BATT_ANG_START, BATT_ANG_END, COL_TEAL_VDIM);
-
-    // Static labels
-    bufDrawTextCentered(52, CY + 18, "AUTO-", &FreeSans9pt7b, 1, COL_TEXTDIM);
-    bufDrawTextCentered(52, CY + 34, "NOMIE", &FreeSans9pt7b, 1, COL_TEXTDIM);
-    bufDrawTextCentered(308, CY + 18, "TEMP", &FreeSans9pt7b, 1, COL_TEXTDIM);
-    bufDrawTextCentered(308, CY + 34, "BATT.", &FreeSans9pt7b, 1, COL_TEXTDIM);
-    bufDrawTextCentered(CX, 316, "BATTERIE", &FreeSans9pt7b, 1, COL_TEXTDIM);
-
-    screenBuf = savedBuf;
-    Serial.println("[DASH] Bezel rendered");
 }
 
 /* ======================================================================
- *  DASHBOARD RENDERING (dynamic elements on top of bezel)
+ *  CREATE DASHBOARD UI
  * ====================================================================== */
-static void renderDashboard() {
-    // 1. Copy static bezel as background
-    memcpy(screenBuf, bezelBuf, SCREEN_W * SCREEN_H * 2);
+static void createDashboard(void) {
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_set_style_bg_color(scr, COL_BG, 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
+    /* ── Tick marks (custom draw on transparent overlay) ── */
+    tickCanvas = lv_obj_create(scr);
+    lv_obj_remove_style_all(tickCanvas);
+    lv_obj_set_size(tickCanvas, SCREEN_W, SCREEN_H);
+    lv_obj_center(tickCanvas);
+    lv_obj_add_event_cb(tickCanvas, drawTicksCb, LV_EVENT_DRAW_MAIN_END, NULL);
+    lv_obj_clear_flag(tickCanvas, LV_OBJ_FLAG_CLICKABLE);
+
+    /* ── Speed arc ── */
+    arcSpeed = lv_arc_create(scr);
+    lv_obj_set_size(arcSpeed, SPEED_R_OUTER * 2, SPEED_R_OUTER * 2);
+    lv_obj_center(arcSpeed);
+    lv_arc_set_rotation(arcSpeed, 0);
+    lv_arc_set_range(arcSpeed, 0, 180);
+    lv_arc_set_value(arcSpeed, 0);
+    lv_arc_set_bg_angles(arcSpeed, SPEED_ARC_START, SPEED_ARC_START + SPEED_ARC_RANGE);
+    lv_arc_set_mode(arcSpeed, LV_ARC_MODE_NORMAL);
+    lv_obj_clear_flag(arcSpeed, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_style(arcSpeed, NULL, LV_PART_KNOB);
+
+    /* Background (dim track) */
+    lv_obj_set_style_arc_color(arcSpeed, COL_TEAL_VDIM, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(arcSpeed, SPEED_ARC_WIDTH, LV_PART_MAIN);
+    lv_obj_set_style_arc_opa(arcSpeed, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(arcSpeed, true, LV_PART_MAIN);
+
+    /* Indicator (colored active part) */
+    lv_obj_set_style_arc_color(arcSpeed, COL_TEAL, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(arcSpeed, SPEED_ARC_WIDTH, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_opa(arcSpeed, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(arcSpeed, true, LV_PART_INDICATOR);
+
+    /* Remove background of the arc object itself */
+    lv_obj_set_style_bg_opa(arcSpeed, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(arcSpeed, 0, 0);
+    lv_obj_set_style_pad_all(arcSpeed, 0, 0);
+
+    /* ── Battery arc ── */
+    arcBatt = lv_arc_create(scr);
+    lv_obj_set_size(arcBatt, BATT_R_OUTER * 2, BATT_R_OUTER * 2);
+    lv_obj_center(arcBatt);
+    lv_arc_set_rotation(arcBatt, 0);
+    lv_arc_set_range(arcBatt, 0, 100);
+    lv_arc_set_value(arcBatt, 0);
+    lv_arc_set_bg_angles(arcBatt, BATT_ARC_START, BATT_ARC_START + BATT_ARC_RANGE);
+    lv_arc_set_mode(arcBatt, LV_ARC_MODE_NORMAL);
+    lv_obj_clear_flag(arcBatt, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_style(arcBatt, NULL, LV_PART_KNOB);
+
+    lv_obj_set_style_arc_color(arcBatt, COL_TEAL_VDIM, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(arcBatt, BATT_ARC_WIDTH, LV_PART_MAIN);
+    lv_obj_set_style_arc_opa(arcBatt, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(arcBatt, true, LV_PART_MAIN);
+
+    lv_obj_set_style_arc_color(arcBatt, COL_TEAL, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(arcBatt, BATT_ARC_WIDTH, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_opa(arcBatt, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(arcBatt, true, LV_PART_INDICATOR);
+
+    lv_obj_set_style_bg_opa(arcBatt, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(arcBatt, 0, 0);
+    lv_obj_set_style_pad_all(arcBatt, 0, 0);
+
+    /* ── Gear indicator (single letter, right of SoC) ── */
+    {
+        gearBox = lv_obj_create(scr);
+        lv_obj_remove_style_all(gearBox);
+        lv_obj_set_size(gearBox, 28, 26);
+        lv_obj_align(gearBox, LV_ALIGN_BOTTOM_MID, 80, -42);
+        lv_obj_set_style_bg_opa(gearBox, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(gearBox, 1, 0);
+        lv_obj_set_style_border_color(gearBox, COL_TEAL, 0);
+        lv_obj_set_style_border_opa(gearBox, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(gearBox, 4, 0);
+        lv_obj_clear_flag(gearBox, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+
+        gearLabel = lv_label_create(gearBox);
+        lv_label_set_text(gearLabel, "P");
+        lv_obj_set_style_text_font(gearLabel, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(gearLabel, COL_BLUE, 0);
+        lv_obj_center(gearLabel);
+    }
+
+    /* ── Speed value (large, centered) ── */
+    lblSpeed = lv_label_create(scr);
+    lv_label_set_text(lblSpeed, "0");
+    lv_obj_set_style_text_font(lblSpeed, &font_montserrat_72, 0);
+    lv_obj_set_style_text_color(lblSpeed, COL_WHITE, 0);
+    lv_obj_set_style_text_align(lblSpeed, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lblSpeed, LV_ALIGN_CENTER, 0, -26);
+
+    lblSpeedUnit = lv_label_create(scr);
+    lv_label_set_text(lblSpeedUnit, "km/h");
+    lv_obj_set_style_text_font(lblSpeedUnit, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lblSpeedUnit, COL_TEAL, 0);
+    lv_obj_align(lblSpeedUnit, LV_ALIGN_CENTER, 0, 14);
+
+    /* ── Range (left widget, inside battery arc) ── */
+    lblRange = lv_label_create(scr);
+    lv_label_set_text(lblRange, "0");
+    lv_obj_set_style_text_font(lblRange, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(lblRange, COL_BLUE, 0);
+    lv_obj_set_style_text_align(lblRange, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lblRange, LV_ALIGN_CENTER, -72, -8);
+
+    lblRangeUnit = lv_label_create(scr);
+    lv_label_set_text(lblRangeUnit, "km");
+    lv_obj_set_style_text_font(lblRangeUnit, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lblRangeUnit, COL_BLUE, 0);
+    lv_obj_align(lblRangeUnit, LV_ALIGN_CENTER, -72, 10);
+
+    lblRangeLbl = lv_label_create(scr);
+    lv_label_set_text(lblRangeLbl, "AUTO-\nNOMIE");
+    lv_obj_set_style_text_font(lblRangeLbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lblRangeLbl, COL_TEXTDIM, 0);
+    lv_obj_set_style_text_align(lblRangeLbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lblRangeLbl, LV_ALIGN_CENTER, -72, 30);
+
+    /* ── Temp (right widget, inside battery arc) ── */
+    lblTemp = lv_label_create(scr);
+    lv_label_set_text(lblTemp, "25");
+    lv_obj_set_style_text_font(lblTemp, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(lblTemp, COL_AMBER, 0);
+    lv_obj_set_style_text_align(lblTemp, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lblTemp, LV_ALIGN_CENTER, 72, -8);
+
+    lblTempUnit = lv_label_create(scr);
+    lv_label_set_text(lblTempUnit, "°C");
+    lv_obj_set_style_text_font(lblTempUnit, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lblTempUnit, COL_AMBER, 0);
+    lv_obj_align(lblTempUnit, LV_ALIGN_CENTER, 72, 10);
+
+    lblTempLbl = lv_label_create(scr);
+    lv_label_set_text(lblTempLbl, "TEMP\nBATT.");
+    lv_obj_set_style_text_font(lblTempLbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lblTempLbl, COL_TEXTDIM, 0);
+    lv_obj_set_style_text_align(lblTempLbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lblTempLbl, LV_ALIGN_CENTER, 72, 30);
+
+    /* ── SoC (bottom center) ── */
+    lblSoc = lv_label_create(scr);
+    lv_label_set_text(lblSoc, "0%");
+    lv_obj_set_style_text_font(lblSoc, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(lblSoc, COL_TEAL, 0);
+    lv_obj_set_style_text_align(lblSoc, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lblSoc, LV_ALIGN_BOTTOM_MID, 0, -74);
+
+    lblSocLbl = lv_label_create(scr);
+    lv_label_set_text(lblSocLbl, "BATTERIE");
+    lv_obj_set_style_text_font(lblSocLbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lblSocLbl, COL_TEXTDIM, 0);
+    lv_obj_align(lblSocLbl, LV_ALIGN_BOTTOM_MID, 0, -52);
+
+    /* ── Regen bar ── */
+    int barW = 100, barH = 4;
+    barRegen = lv_bar_create(scr);
+    lv_obj_set_size(barRegen, barW, barH);
+    lv_obj_align(barRegen, LV_ALIGN_BOTTOM_MID, 0, -24);
+    lv_bar_set_range(barRegen, 0, 100);
+    lv_bar_set_value(barRegen, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(barRegen, COL_TEAL_VDIM, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(barRegen, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(barRegen, COL_TEAL, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(barRegen, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(barRegen, 2, LV_PART_MAIN);
+    lv_obj_set_style_radius(barRegen, 2, LV_PART_INDICATOR);
+
+    lblRegenLbl = lv_label_create(scr);
+    lv_label_set_text(lblRegenLbl, "REGEN");
+    lv_obj_set_style_text_font(lblRegenLbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lblRegenLbl, COL_TEXTDIM, 0);
+    lv_obj_align(lblRegenLbl, LV_ALIGN_BOTTOM_MID, -30, -30);
+
+    lblRegenKw = lv_label_create(scr);
+    lv_label_set_text(lblRegenKw, "0 kW");
+    lv_obj_set_style_text_font(lblRegenKw, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lblRegenKw, COL_TEXTDIM, 0);
+    lv_obj_align(lblRegenKw, LV_ALIGN_BOTTOM_MID, 34, -30);
+
+    /* ── Connection status dots (bottom, small, centered) ── */
+    dotBridge = lv_obj_create(scr);
+    lv_obj_remove_style_all(dotBridge);
+    lv_obj_set_size(dotBridge, 5, 5);
+    lv_obj_align(dotBridge, LV_ALIGN_BOTTOM_MID, -6, -6);
+    lv_obj_set_style_radius(dotBridge, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(dotBridge, COL_AMBER, 0);
+    lv_obj_set_style_bg_opa(dotBridge, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(dotBridge, LV_OBJ_FLAG_CLICKABLE);
+
+    dotCamera = lv_obj_create(scr);
+    lv_obj_remove_style_all(dotCamera);
+    lv_obj_set_size(dotCamera, 5, 5);
+    lv_obj_align(dotCamera, LV_ALIGN_BOTTOM_MID, 6, -6);
+    lv_obj_set_style_radius(dotCamera, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(dotCamera, COL_RED, 0);
+    lv_obj_set_style_bg_opa(dotCamera, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(dotCamera, LV_OBJ_FLAG_CLICKABLE);
+
+    Serial.println("[LVGL] Dashboard UI created");
+}
+
+/* ======================================================================
+ *  UPDATE DASHBOARD FROM CAN DATA
+ * ====================================================================== */
+static void updateDashboard(void) {
     int speed = canData.uiSpeed;
     if (speed > 180) speed = 180;
     uint8_t soc = canData.soc;
     uint8_t gear = canData.gear;
 
-    // 2. Speed arc (colored, over the dim track)
-    if (speed > 0) {
-        float endA = SPEED_ANG_START + (speed / 180.0f) * SPEED_ANG_RANGE;
-        uint16_t sCol = speedColor(speed);
-        // Glow (wider, dimmer)
-        bufFillArc(CX, CY, SPEED_R_ARC_IN - 3, SPEED_R_ARC_OUT + 3,
-                   SPEED_ANG_START, endA, COL_TEAL_VDIM);
-        // Main colored arc
-        bufFillArc(CX, CY, SPEED_R_ARC_IN, SPEED_R_ARC_OUT,
-                   SPEED_ANG_START, endA, sCol);
-        // Tip dot
-        float midR = (SPEED_R_ARC_IN + SPEED_R_ARC_OUT) / 2.0f;
-        int tx = CX + (int)(midR * cosf(endA));
-        int ty = CY + (int)(midR * sinf(endA));
-        bufFillCircle(tx, ty, 5, sCol);
-    }
+    /* Speed arc */
+    lv_arc_set_value(arcSpeed, speed);
+    lv_color_t sCol = lvSpeedColor(speed);
+    lv_obj_set_style_arc_color(arcSpeed, sCol, LV_PART_INDICATOR);
 
-    // 3. Battery SoC arc (colored)
-    if (soc > 0) {
-        float endA = BATT_ANG_START + (soc / 100.0f) * BATT_ANG_RANGE;
-        uint16_t bCol = socColor(soc);
-        bufFillArc(CX, CY, BATT_R_ARC_IN - 2, BATT_R_ARC_OUT + 2,
-                   BATT_ANG_START, endA, COL_TEAL_VDIM);
-        bufFillArc(CX, CY, BATT_R_ARC_IN, BATT_R_ARC_OUT,
-                   BATT_ANG_START, endA, bCol);
-        float midR = (BATT_R_ARC_IN + BATT_R_ARC_OUT) / 2.0f;
-        int tx = CX + (int)(midR * cosf(endA));
-        int ty = CY + (int)(midR * sinf(endA));
-        bufFillCircle(tx, ty, 3, bCol);
-    }
+    /* Battery arc */
+    lv_arc_set_value(arcBatt, soc);
+    lv_color_t bCol = lvSocColor(soc);
+    lv_obj_set_style_arc_color(arcBatt, bCol, LV_PART_INDICATOR);
 
-    // 4. Gear selector (P R N D) at top
+    /* Gear indicator */
     {
-        const char gLabels[] = "PRND";
-        const uint8_t gVals[] = { GEAR_P, GEAR_R, GEAR_N, GEAR_D };
-        const uint16_t gCols[] = { COL_BLUE, COL_RED, COL_AMBER, COL_TEAL };
-        int boxW = 28, boxH = 24, gap = 6;
-        int totalW = 4 * boxW + 3 * gap;
-        int gx0 = CX - totalW / 2;
-        int gy = 88;
-        for (int i = 0; i < 4; i++) {
-            int bx = gx0 + i * (boxW + gap);
-            bool active = (gear == gVals[i]);
-            uint16_t brdCol = active ? gCols[i] : COL_TEAL_VDIM;
-            uint16_t txtCol = active ? gCols[i] : COL_TEAL_VDIM;
-            // Border
-            bufFillRect(bx, gy, boxW, 1, brdCol);
-            bufFillRect(bx, gy + boxH - 1, boxW, 1, brdCol);
-            bufFillRect(bx, gy, 1, boxH, brdCol);
-            bufFillRect(bx + boxW - 1, gy, 1, boxH, brdCol);
-            // Active tint fill
-            if (active) {
-                for (int jj = gy + 1; jj < gy + boxH - 1; jj++)
-                    for (int ii = bx + 1; ii < bx + boxW - 1; ii++)
-                        bufPixel(ii, jj, COL_TEAL_VDIM);
-            }
-            // Letter
-            char gs[2] = { gLabels[i], 0 };
-            int tw = bufTextWidth(gs, &FreeSans9pt7b, 1);
-            bufDrawText(bx + (boxW - tw) / 2, gy + 18, gs, &FreeSans9pt7b, 1, txtCol);
-        }
+        const char *gLetters[] = { "?", "P", "R", "N", "D" };
+        const lv_color_t gColors[] = { COL_TEAL_VDIM, COL_BLUE, COL_RED, COL_AMBER, COL_TEAL };
+        int idx = (gear >= 1 && gear <= 4) ? gear : 0;
+        lv_label_set_text(gearLabel, gLetters[idx]);
+        lv_obj_set_style_text_color(gearLabel, gColors[idx], 0);
+        lv_obj_set_style_border_color(gearBox, gColors[idx], 0);
     }
 
-    // 5. Speed number (large, centered)
+    /* Speed number */
     {
-        char spdStr[4];
-        snprintf(spdStr, sizeof(spdStr), "%d", (int)canData.uiSpeed);
-        bufDrawTextCentered(CX, CY + 12, spdStr, &FreeSansBold24pt7b, 3, COL_WHITE);
-        bufDrawTextCentered(CX, CY + 46, "km/h", &FreeSans9pt7b, 1, COL_TEAL);
+        char buf[4];
+        snprintf(buf, sizeof(buf), "%d", (int)canData.uiSpeed);
+        lv_label_set_text(lblSpeed, buf);
     }
 
-    // 6. Range (left widget)
+    /* Range */
     {
-        char rStr[6];
-        snprintf(rStr, sizeof(rStr), "%d", (int)canData.rangeKm);
-        bufDrawTextCentered(52, CY - 6, rStr, &FreeSansBold24pt7b, 1, COL_BLUE);
-        bufDrawTextCentered(52, CY + 8, "km", &FreeSans9pt7b, 1, COL_BLUE);
+        char buf[6];
+        snprintf(buf, sizeof(buf), "%d", (int)canData.rangeKm);
+        lv_label_set_text(lblRange, buf);
+        lv_obj_align(lblRange, LV_ALIGN_CENTER, -72, -8);
     }
 
-    // 7. Battery temp (right widget)
+    /* Battery temp */
     {
-        char tStr[6];
-        snprintf(tStr, sizeof(tStr), "%d", (int)(canData.battTempMax + 0.5f));
-        uint16_t tc = tempColor(canData.battTempMax);
-        bufDrawTextCentered(308, CY - 6, tStr, &FreeSansBold24pt7b, 1, tc);
-        bufDrawTextCentered(308, CY + 8, "C", &FreeSans9pt7b, 1, tc);
+        char buf[6];
+        snprintf(buf, sizeof(buf), "%d", (int)(canData.battTempMax + 0.5f));
+        lv_label_set_text(lblTemp, buf);
+        lv_color_t tc = lvTempColor(canData.battTempMax);
+        lv_obj_set_style_text_color(lblTemp, tc, 0);
+        lv_obj_set_style_text_color(lblTempUnit, tc, 0);
+        lv_obj_align(lblTemp, LV_ALIGN_CENTER, 72, -8);
     }
 
-    // 8. SoC percentage (bottom center)
+    /* SoC */
     {
-        char socStr[5];
-        snprintf(socStr, sizeof(socStr), "%d%%", soc);
-        uint16_t sc = socColor(soc);
-        bufDrawTextCentered(CX, 298, socStr, &FreeSansBold24pt7b, 1, sc);
+        char buf[5];
+        snprintf(buf, sizeof(buf), "%d%%", soc);
+        lv_label_set_text(lblSoc, buf);
+        lv_color_t sc = lvSocColor(soc);
+        lv_obj_set_style_text_color(lblSoc, sc, 0);
+        lv_obj_align(lblSoc, LV_ALIGN_BOTTOM_MID, 0, -74);
     }
 
-    // 9. Regen bar (bottom)
+    /* Regen */
     {
         float totalPower = canData.rearPowerKw + canData.frontPowerKw;
         float regen = (totalPower < 0) ? -totalPower : 0;
         regenKwSmooth = regenKwSmooth * 0.72f + regen * 0.28f;
         if (regenKwSmooth < 0.2f) regenKwSmooth = 0;
 
-        int barY = 338, barW = 100, barH = 4;
-        int barX = CX - barW / 2;
-        bufFillRect(barX, barY, barW, barH, COL_TEAL_VDIM);
-        float pct = regenKwSmooth / MAX_REGEN_KW;
-        if (pct > 1.0f) pct = 1.0f;
-        int fillW = (int)(barW * pct);
-        if (fillW > 0)
-            bufFillRect(barX, barY, fillW, barH, COL_TEAL);
-        // Labels
-        bufDrawText(barX, barY - 8, "REGEN", &FreeSans9pt7b, 1, COL_TEXTDIM);
-        char kwStr[10];
-        snprintf(kwStr, sizeof(kwStr), "%.0f kW", regenKwSmooth);
-        uint16_t kwCol = (regenKwSmooth < 0.2f) ? COL_TEXTDIM : COL_TEAL;
-        bufDrawTextRight(barX + barW, barY - 8, kwStr, &FreeSans9pt7b, 1, kwCol);
+        int pct = (int)(regenKwSmooth / MAX_REGEN_KW * 100);
+        if (pct > 100) pct = 100;
+        lv_bar_set_value(barRegen, pct, LV_ANIM_OFF);
+
+        char buf[10];
+        snprintf(buf, sizeof(buf), "%.0f kW", regenKwSmooth);
+        lv_label_set_text(lblRegenKw, buf);
+        lv_color_t kwCol = (regenKwSmooth < 0.2f) ? COL_TEXTDIM : COL_TEAL;
+        lv_obj_set_style_text_color(lblRegenKw, kwCol, 0);
+        lv_obj_align(lblRegenKw, LV_ALIGN_BOTTOM_MID, 34, -30);
     }
 
-    // 10. Connection status dots
+    /* Connection dots */
     {
         unsigned long now = millis();
         bool blinkOn = (now / 500) % 2 == 0;
-        // Bridge (left)
-        uint16_t bCol;
+        lv_color_t bDotCol;
         if (bridgeEverSeen && (now - lastBridgeMsg < BRIDGE_TIMEOUT_MS))
-            bCol = COL_GREEN;
+            bDotCol = COL_GREEN;
         else if (!bridgeEverSeen)
-            bCol = blinkOn ? COL_AMBER : COL_BG;
+            bDotCol = blinkOn ? COL_AMBER : COL_BG;
         else
-            bCol = COL_RED;
-        bufFillCircle(CX - 25, 20, 6, bCol);
-        // Camera (right)
-        uint16_t cCol = (WiFi.status() == WL_CONNECTED) ? COL_GREEN : COL_RED;
-        bufFillCircle(CX + 25, 20, 6, cCol);
-    }
+            bDotCol = COL_RED;
+        lv_obj_set_style_bg_color(dotBridge, bDotCol, 0);
 
-    // 11. Flush to display
-    gfx->draw16bitRGBBitmap(0, 0, screenBuf, SCREEN_W, SCREEN_H);
-    idleScreenDrawn = true;
-    screenBlank = false;
+        lv_color_t cDotCol = (WiFi.status() == WL_CONNECTED) ? COL_GREEN : COL_RED;
+        lv_obj_set_style_bg_color(dotCamera, cDotCol, 0);
+    }
 }
 
 /* ======================================================================
@@ -560,21 +643,21 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
 
     switch (m->can_id) {
 
-    case CAN_ID_SPEED: // 0x257 -- DI_uiSpeed (bit 24, 9 bits)
+    case CAN_ID_SPEED:
         if (m->dlc >= 4) {
             uint16_t raw = m->data[3] | ((uint16_t)(m->data[4] & 0x01) << 8);
             canData.uiSpeed = raw;
         }
         break;
 
-    case CAN_ID_GEAR: // 0x118 -- DI_gear (bit 21, 3 bits)
+    case CAN_ID_GEAR:
         if (m->dlc >= 3) {
             uint8_t raw = (m->data[2] >> 5) & 0x07;
             if (raw != GEAR_SNA) canData.gear = raw;
         }
         break;
 
-    case CAN_ID_RANGE_SOC: // 0x33A -- UI_Range (bit 0, 10 bits), UI_SOC (bit 48, 7 bits)
+    case CAN_ID_RANGE_SOC:
         if (m->dlc >= 7) {
             uint16_t rangeMi = m->data[0] | ((uint16_t)(m->data[1] & 0x03) << 8);
             canData.rangeKm = (uint16_t)(rangeMi * 1.609f + 0.5f);
@@ -583,7 +666,7 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
         }
         break;
 
-    case CAN_ID_BMS_SOC: // 0x292 -- SOCUI292 (bit 10, 10 bits, x0.1)
+    case CAN_ID_BMS_SOC:
         if (m->dlc >= 3) {
             uint16_t raw = ((m->data[1] >> 2) & 0x3F) | ((uint16_t)m->data[2] << 6);
             raw &= 0x3FF;
@@ -592,7 +675,7 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
         }
         break;
 
-    case CAN_ID_BATT_TEMP: { // 0x312 -- BMSmaxPackTemperature (bit 53, 9 bits, x0.25 -25)
+    case CAN_ID_BATT_TEMP: {
         if (m->dlc >= 8) {
             uint16_t raw = ((m->data[6] >> 5) & 0x07) | ((uint16_t)m->data[7] << 3);
             raw &= 0x1FF;
@@ -601,7 +684,7 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
         break;
     }
 
-    case CAN_ID_REAR_PWR: // 0x266 -- RearPower266 (bit 0, 11 bits, signed, x0.5)
+    case CAN_ID_REAR_PWR:
         if (m->dlc >= 2) {
             uint16_t raw = m->data[0] | ((uint16_t)(m->data[1] & 0x07) << 8);
             int16_t val = (raw & 0x400) ? (raw | 0xF800) : raw;
@@ -609,7 +692,7 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
         }
         break;
 
-    case CAN_ID_FRONT_PWR: // 0x2E5 -- FrontPower2E5 (bit 0, 11 bits, signed, x0.5)
+    case CAN_ID_FRONT_PWR:
         if (m->dlc >= 2) {
             uint16_t raw = m->data[0] | ((uint16_t)(m->data[1] & 0x07) << 8);
             int16_t val = (raw & 0x400) ? (raw | 0xF800) : raw;
@@ -652,7 +735,7 @@ void sendCtrlCommand(const char *cmd) {
 /* ======================================================================
  *  CAMERA STREAM (JPEG)
  * ====================================================================== */
-void udpRecvTask(void *pvParameters);  // forward declaration
+void udpRecvTask(void *pvParameters);
 
 void startWiFi() {
     WiFi.mode(WIFI_STA);
@@ -783,24 +866,23 @@ void decodeAndDisplay(int bufIdx, size_t len) {
     releaseDisplayBuffer();
     gfx->draw16bitRGBBitmap(0, 0, screenBuf, SCREEN_W, SCREEN_H);
     screenBlank = false;
-    idleScreenDrawn = false;
     firstFrameReceived = true;
 }
 
-/* Draw status dots overlay on camera view */
+/* Draw status dots overlay on camera view (direct GFX, bypasses LVGL) */
 static void drawStatusDotsOverlay() {
     unsigned long now = millis();
     bool blinkOn = (now / 500) % 2 == 0;
-    uint16_t bCol;
+    uint16_t bCol16;
     if (bridgeEverSeen && (now - lastBridgeMsg < BRIDGE_TIMEOUT_MS))
-        bCol = COL_GREEN;
+        bCol16 = 0x07E0; // GREEN
     else if (!bridgeEverSeen)
-        bCol = blinkOn ? COL_AMBER : COL_BG;
+        bCol16 = blinkOn ? 0xFD40 : 0x0000; // AMBER or BLACK
     else
-        bCol = COL_RED;
-    gfx->fillCircle(CX - 25, 20, 6, bCol);
-    uint16_t cCol = (WiFi.status() == WL_CONNECTED) ? COL_GREEN : COL_RED;
-    gfx->fillCircle(CX + 25, 20, 6, cCol);
+        bCol16 = 0xF9A6; // RED
+    gfx->fillCircle(CX - 8, SCREEN_H - 8, 3, bCol16);
+    uint16_t cCol16 = (WiFi.status() == WL_CONNECTED) ? 0x07E0 : 0xF9A6;
+    gfx->fillCircle(CX + 8, SCREEN_H - 8, 3, cCol16);
 }
 
 /* ======================================================================
@@ -809,9 +891,9 @@ static void drawStatusDotsOverlay() {
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.println("\n=== TeslaCam - Display (Dashboard + Camera) ===");
+    Serial.println("\n=== TeslaCam - Display (LVGL Dashboard + Camera) ===");
 
-    // Allocate PSRAM buffers
+    /* ── Allocate PSRAM buffers for camera ── */
     for (int i = 0; i < 3; i++) {
         jpegBuf[i] = (uint8_t *)heap_caps_malloc(MAX_FRAME_SIZE, MALLOC_CAP_SPIRAM);
         if (!jpegBuf[i]) {
@@ -820,19 +902,16 @@ void setup() {
         }
     }
     screenBuf = (uint16_t *)heap_caps_malloc(SCREEN_W * SCREEN_H * 2, MALLOC_CAP_SPIRAM);
-    bezelBuf  = (uint16_t *)heap_caps_malloc(SCREEN_W * SCREEN_H * 2, MALLOC_CAP_SPIRAM);
-    if (!screenBuf || !bezelBuf) {
+    if (!screenBuf) {
         Serial.println("[FATAL] Screen buffer alloc failed");
         while (true) delay(1000);
     }
     memset(screenBuf, 0, SCREEN_W * SCREEN_H * 2);
-    memset(bezelBuf,  0, SCREEN_W * SCREEN_H * 2);
-    Serial.println("[MEM] 3x65KB JPEG + 2x259KB screen buffers allocated");
     Serial.printf("[MEM] Free PSRAM: %u\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     tbMutex = xSemaphoreCreateMutex();
 
-    // Display init
+    /* ── Display init ── */
     if (!gfx->begin()) {
         Serial.println("[FATAL] GFX begin failed");
         while (true) delay(1000);
@@ -842,22 +921,44 @@ void setup() {
     digitalWrite(TFT_BL, HIGH);
     Serial.println("[GFX] Display OK");
 
-    // Render static bezel
-    renderBezel();
+    /* ── LVGL init ── */
+    lv_init();
 
-    // Touch
+    /* Allocate draw buffers in PSRAM */
+    uint32_t bufSize = SCREEN_W * LV_BUF_LINES;
+    lvBuf1 = (lv_color_t *)heap_caps_malloc(bufSize * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    lvBuf2 = (lv_color_t *)heap_caps_malloc(bufSize * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    if (!lvBuf1 || !lvBuf2) {
+        Serial.println("[FATAL] LVGL buffer alloc failed");
+        while (true) delay(1000);
+    }
+    lv_disp_draw_buf_init(&lvDrawBuf, lvBuf1, lvBuf2, bufSize);
+
+    /* Display driver */
+    lv_disp_drv_init(&lvDispDrv);
+    lvDispDrv.hor_res = SCREEN_W;
+    lvDispDrv.ver_res = SCREEN_H;
+    lvDispDrv.flush_cb = lvFlushCb;
+    lvDispDrv.draw_buf = &lvDrawBuf;
+    lv_disp_drv_register(&lvDispDrv);
+
+    Serial.println("[LVGL] Initialized");
+
+    /* ── Create dashboard ── */
+    createDashboard();
+
+    /* ── Touch ── */
     Wire.begin(TOUCH_SDA, TOUCH_SCL);
     delay(50);
     Serial.println("[TOUCH] CST816S init");
 
-    // Start WiFi (non-blocking)
+    /* ── WiFi (non-blocking) ── */
     startWiFi();
-
     lastFrameTime = millis();
 
-    // Initial dashboard render
-    renderDashboard();
-    Serial.println("[DASH] Dashboard ready - touch to activate camera");
+    /* First LVGL render */
+    lv_timer_handler();
+    Serial.println("[DASH] LVGL Dashboard ready - touch to activate camera");
 }
 
 /* ======================================================================
@@ -865,23 +966,21 @@ void setup() {
  * ====================================================================== */
 static unsigned long dispFrames = 0;
 static unsigned long dispT0 = 0;
-static unsigned long lastDashRedraw = 0;
-#define DASH_REDRAW_MS 100
 
 void loop() {
     unsigned long now = millis();
 
-    // -- WiFi connection management (non-blocking) --
+    /* ── WiFi connection management ── */
     if (!wifiConnected && WiFi.status() == WL_CONNECTED) {
         wifiConnected = true;
         Serial.printf("[WIFI] Connected - IP: %s\n", WiFi.localIP().toString().c_str());
         setupNetwork();
     } else if (wifiConnected && WiFi.status() != WL_CONNECTED) {
         wifiConnected = false;
-        Serial.println("[WIFI] Disconnected - will auto-reconnect");
+        Serial.println("[WIFI] Disconnected");
     }
 
-    // -- Touch toggle --
+    /* ── Touch toggle ── */
     bool touchedNow = isTouched();
     if (touchedPrev && !touchedNow && (now - lastToggleMs > TOUCH_DEBOUNCE_MS)) {
         streamActive = !streamActive;
@@ -891,25 +990,25 @@ void loop() {
             lastCtrlSendMs = now;
             lastFrameTime = now;
             firstFrameReceived = false;
-            idleScreenDrawn = false;
             Serial.println("[TOUCH] Camera ON");
         } else {
             sendCtrlCommand("STOP");
             lastCtrlSendMs = now;
             firstFrameReceived = false;
-            idleScreenDrawn = false;
+            /* Force LVGL full redraw when returning to dashboard */
+            lv_obj_invalidate(lv_scr_act());
             Serial.println("[TOUCH] Camera OFF");
         }
     }
     touchedPrev = touchedNow;
 
-    // -- Heartbeat STRT --
+    /* ── Heartbeat STRT ── */
     if (streamActive && (now - lastCtrlSendMs >= CTRL_RESEND_MS)) {
         sendCtrlCommand("STRT");
         lastCtrlSendMs = now;
     }
 
-    // -- Camera mode --
+    /* ── Camera mode (bypass LVGL, direct JPEG) ── */
     if (streamActive) {
         size_t len;
         int idx = grabReadyFrame(&len);
@@ -926,17 +1025,17 @@ void loop() {
             taskYIELD();
         }
     }
-    // -- Dashboard mode --
+    /* ── Dashboard mode (LVGL) ── */
     else {
+        /* Drain any leftover frames */
         size_t dummyLen;
         int idx = grabReadyFrame(&dummyLen);
         if (idx >= 0) releaseDisplayBuffer();
 
-        if (now - lastDashRedraw >= DASH_REDRAW_MS) {
-            renderDashboard();
-            lastDashRedraw = now;
-        } else {
-            delay(5);
-        }
+        /* Update widget values from CAN data */
+        updateDashboard();
+
+        /* Let LVGL render (handles its own dirty tracking) */
+        lv_timer_handler();
     }
 }
