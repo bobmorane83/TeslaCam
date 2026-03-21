@@ -81,6 +81,8 @@ static int tbWrite = 0, tbReady = -1, tbDisplay = -1;
 static size_t tbReadyLen = 0;
 static uint16_t currentFrameId = 0, expectedChunks = 0, receivedChunks = 0;
 static size_t recvFrameLen = 0;
+static unsigned long frameStartMs = 0;
+#define FRAME_ASSEMBLY_TIMEOUT_MS 200
 
 /* ======================================================================
  *  SCREEN BUFFERS (for camera JPEG mode)
@@ -856,6 +858,20 @@ void setupNetwork() {
     networkReady = true;
 }
 
+/* Promote current write buffer as a ready frame (complete or partial) */
+static void promoteCurrentFrame() {
+    xSemaphoreTake(tbMutex, portMAX_DELAY);
+    tbReady = tbWrite;
+    tbReadyLen = recvFrameLen;
+    for (int i = 0; i < 3; i++)
+        if (i != tbReady && i != tbDisplay) { tbWrite = i; break; }
+    xSemaphoreGive(tbMutex);
+    lastFrameTime = millis();
+    receivedChunks = 0;
+    recvFrameLen   = 0;
+    expectedChunks = 0;
+}
+
 void processPacket(uint8_t *data, size_t len) {
     if (len < HEADER_SIZE) return;
     uint16_t frameId, chunkId, totalChunks, chunkSize;
@@ -865,10 +881,15 @@ void processPacket(uint8_t *data, size_t len) {
     memcpy(&chunkSize,   data + 6, 2);
     if (chunkSize > CHUNK_PAYLOAD || chunkSize + HEADER_SIZE > len) return;
     if (frameId != currentFrameId) {
+        /* New frame arrived — promote previous partial frame if >50% received */
+        if (expectedChunks > 0 && receivedChunks > expectedChunks / 2) {
+            promoteCurrentFrame();
+        }
         currentFrameId = frameId;
         expectedChunks = totalChunks;
         receivedChunks = 0;
         recvFrameLen   = 0;
+        frameStartMs   = millis();
     }
     uint32_t offset = (uint32_t)chunkId * CHUNK_PAYLOAD;
     if (offset + chunkSize > MAX_FRAME_SIZE) return;
@@ -876,24 +897,32 @@ void processPacket(uint8_t *data, size_t len) {
     size_t endPos = offset + chunkSize;
     if (endPos > recvFrameLen) recvFrameLen = endPos;
     receivedChunks++;
-    if (receivedChunks == expectedChunks) {
-        xSemaphoreTake(tbMutex, portMAX_DELAY);
-        tbReady = tbWrite;
-        tbReadyLen = recvFrameLen;
-        for (int i = 0; i < 3; i++)
-            if (i != tbReady && i != tbDisplay) { tbWrite = i; break; }
-        xSemaphoreGive(tbMutex);
-        lastFrameTime = millis();
-        receivedChunks = 0;
-        recvFrameLen = 0;
+    if (expectedChunks > 0 && receivedChunks >= expectedChunks) {
+        promoteCurrentFrame();
     }
 }
 
 void udpRecvTask(void *pvParameters) {
+    /* Periodic timeout so we can check frame assembly stalls */
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 }; // 100ms
+    setsockopt(udp_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     uint8_t buf[HEADER_SIZE + CHUNK_PAYLOAD];
     while (true) {
         int len = recvfrom(udp_sock, buf, sizeof(buf), 0, NULL, NULL);
         if (len > 0) processPacket(buf, len);
+
+        /* Frame assembly timeout: accept partial or discard stale frame */
+        if (expectedChunks > 0 && receivedChunks > 0 &&
+            (millis() - frameStartMs > FRAME_ASSEMBLY_TIMEOUT_MS)) {
+            if (receivedChunks > expectedChunks / 2) {
+                promoteCurrentFrame();
+            } else {
+                receivedChunks = 0;
+                recvFrameLen   = 0;
+                expectedChunks = 0;
+            }
+        }
     }
 }
 
@@ -1109,7 +1138,13 @@ void loop() {
                 Serial.printf("[CAM] %lu frames, %.1f fps\n", dispFrames, fps);
             }
         } else {
-            taskYIELD();
+            /* No frame ready — show no-signal if stream timed out */
+            if (firstFrameReceived && (now - lastFrameTime > FRAME_TIMEOUT_MS)) {
+                bool blinkOn = (now / 500) % 2 == 0;
+                gfx->fillCircle(CX, CY - 20, 6, blinkOn ? 0xF800 : 0x0000);
+                drawStatusDotsOverlay();
+            }
+            delay(5);
         }
     }
     /* ── Dashboard mode (LVGL) ── */
