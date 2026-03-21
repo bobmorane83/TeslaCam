@@ -117,6 +117,7 @@ typedef struct __attribute__((packed)) {
 #define CAN_ID_FRONT_PWR 0x2E5
 #define CAN_ID_BMS_SOC   0x292
 #define CAN_ID_UTC_TIME  0x318
+#define CAN_ID_HVAC_STATUS 0x243
 #define CAN_ID_HEARTBEAT 0xFFF
 
 #define GEAR_INVALID 0
@@ -140,7 +141,11 @@ static volatile struct {
     uint8_t  utcHour;
     uint8_t  utcMinute;
     bool     timeReceived;
-} canData = { 0, GEAR_P, 0, 0, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0, 0, false };
+    float    outdoorTemp;
+    bool     outdoorTempReceived;
+    float    cabinTemp;
+    bool     cabinTempReceived;
+} canData = { 0, GEAR_P, 0, 0, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0, 0, false, 0.0f, false, 0.0f, false };
 
 #define BRIDGE_TIMEOUT_MS 5000
 static volatile unsigned long lastBridgeMsg = 0;
@@ -225,6 +230,10 @@ static lv_obj_t *lblSoc;
 static lv_obj_t *lblSocLbl;
 static lv_obj_t *lblRegenLbl;
 static lv_obj_t *lblRegenKw;
+
+/* Temperature labels (near time) */
+static lv_obj_t *lblCabinTemp;
+static lv_obj_t *lblOutdoorTemp;
 
 /* Regen bar */
 static lv_obj_t *barRegen;
@@ -420,6 +429,21 @@ static void createDashboard(void) {
     lv_obj_set_style_text_color(lblTime, COL_WHITE, 0);
     lv_obj_set_style_text_align(lblTime, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(lblTime, LV_ALIGN_CENTER, 0, -80);
+
+    /* ── Cabin temp (right of time) ── */
+    lblCabinTemp = lv_label_create(scr);
+    lv_label_set_text(lblCabinTemp, "--\xC2\xB0");
+    lv_obj_set_style_text_font(lblCabinTemp, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lblCabinTemp, COL_GREY, 0);
+    lv_obj_align(lblCabinTemp, LV_ALIGN_CENTER, 55, -80);
+
+    /* ── Outdoor temp (left of time) ── */
+    lblOutdoorTemp = lv_label_create(scr);
+    lv_label_set_text(lblOutdoorTemp, "--\xC2\xB0");
+    lv_obj_set_style_text_font(lblOutdoorTemp, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lblOutdoorTemp, COL_GREY, 0);
+    lv_obj_set_style_text_align(lblOutdoorTemp, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_align(lblOutdoorTemp, LV_ALIGN_CENTER, -55, -80);
 
     /* ── Speed value (large, centered) ── */
     lblSpeed = lv_label_create(scr);
@@ -655,6 +679,28 @@ static void updateDashboard(void) {
         lv_obj_set_style_text_color(lblTime, COL_GREY, 0);
     }
 
+    /* Cabin temp (right of time) */
+    if (canData.cabinTempReceived && !noConnection) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%.0f\xC2\xB0", canData.cabinTemp);
+        lv_label_set_text(lblCabinTemp, buf);
+        lv_obj_set_style_text_color(lblCabinTemp, COL_AMBER, 0);
+    } else {
+        lv_label_set_text(lblCabinTemp, "--\xC2\xB0");
+        lv_obj_set_style_text_color(lblCabinTemp, COL_GREY, 0);
+    }
+
+    /* Outdoor temp (left of time) */
+    if (canData.outdoorTempReceived && !noConnection) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%.0f\xC2\xB0", canData.outdoorTemp);
+        lv_label_set_text(lblOutdoorTemp, buf);
+        lv_obj_set_style_text_color(lblOutdoorTemp, COL_BLUE, 0);
+    } else {
+        lv_label_set_text(lblOutdoorTemp, "--\xC2\xB0");
+        lv_obj_set_style_text_color(lblOutdoorTemp, COL_GREY, 0);
+    }
+
     /* Connection dots */
     {
         bool blinkOn = (now / 500) % 2 == 0;
@@ -756,6 +802,34 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
             if (raw != 0x3FF) {  /* 1023 = SNA */
                 canData.coolantTemp = temp;
                 canData.battTempReceived = true;
+            }
+        }
+        if (m->dlc >= 6) {
+            /* VCFRONT_tempAmbientFiltered: bit 40, 8 bits, ×0.5 −40°C */
+            uint8_t raw = m->data[5];
+            if (raw != 0) {  /* 0 = SNA */
+                canData.outdoorTemp = raw * 0.5f - 40.0f;
+                canData.outdoorTempReceived = true;
+            }
+        }
+        break;
+
+    case CAN_ID_HVAC_STATUS:
+        if (m->dlc >= 6) {
+            /* Multiplexed: index at bits 0-1 */
+            uint8_t muxIdx = m->data[0] & 0x03;
+            if (muxIdx == 0) {
+                /* VCRIGHT_hvacCabinTempEst: bit 30, 11 bits, ×0.1 −40°C */
+                uint16_t raw = ((m->data[3] >> 6) & 0x03) |
+                               ((uint16_t)m->data[4] << 2) |
+                               ((uint16_t)(m->data[5] & 0x01) << 10);
+                if (raw != 0x7FF) {  /* 2047 = likely SNA */
+                    float temp = raw * 0.1f - 40.0f;
+                    if (temp > -40.0f && temp < 60.0f) {
+                        canData.cabinTemp = temp;
+                        canData.cabinTempReceived = true;
+                    }
+                }
             }
         }
         break;
