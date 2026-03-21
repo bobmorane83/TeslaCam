@@ -8,6 +8,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include "esp_camera.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
@@ -82,7 +83,7 @@ bool initCamera() {
 
     if (psramFound()) {
         cfg.frame_size   = FRAMESIZE_HVGA;   // 480×320 – smaller JPEG, lower latency
-        cfg.jpeg_quality = 12;
+        cfg.jpeg_quality = 18;               // Lower quality = smaller JPEG = fewer UDP chunks
         cfg.fb_count     = 2;
         cfg.fb_location  = CAMERA_FB_IN_PSRAM;
         Serial.println("[CAM] PSRAM \u2013 HVGA, 2 buffers");
@@ -189,6 +190,18 @@ void sendFrame(camera_fb_t *fb) {
         Serial.printf("[UDP] Frame %u: %u chunks, %u bytes, %d errors\n",
                       frame_id, total_chunks, fb->len, errors);
     }
+    /* Send END-of-frame marker: frameId + chunkId=0xFFFF + totalChunks + size=0 */
+    {
+        uint16_t endMarker = 0xFFFF;
+        uint16_t zero = 0;
+        memcpy(packet + 0, &frame_id,      2);
+        memcpy(packet + 2, &endMarker,     2);
+        memcpy(packet + 4, &total_chunks,  2);
+        memcpy(packet + 6, &zero,          2);
+        sendto(udp_sock, packet, HEADER_SIZE, 0,
+               (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    }
+
     frame_id++;
 }
 
@@ -353,6 +366,7 @@ void setup() {
 
     startSoftAP();
     WiFi.setSleep(false);  // Disable WiFi power saving for max throughput
+    esp_wifi_set_max_tx_power(78);  // Max TX power (19.5 dBm) for EMI resilience
     initUDP();
 
     // Launch streaming + control task on core 1 (core 0 free for WiFi driver)

@@ -830,6 +830,7 @@ void startWiFi() {
     WiFi.config(STATIC_IP, GATEWAY, SUBNET);
     WiFi.begin(AP_SSID);
     WiFi.setSleep(false);
+    esp_wifi_set_max_tx_power(78);  // Max TX power (19.5 dBm) for EMI resilience
     Serial.printf("[WIFI] Connecting to %s (non-blocking)\n", AP_SSID);
 }
 
@@ -879,6 +880,15 @@ void processPacket(uint8_t *data, size_t len) {
     memcpy(&chunkId,     data + 2, 2);
     memcpy(&totalChunks, data + 4, 2);
     memcpy(&chunkSize,   data + 6, 2);
+
+    /* END-of-frame marker: chunkId == 0xFFFF */
+    if (chunkId == 0xFFFF) {
+        if (frameId == currentFrameId && expectedChunks > 0 && receivedChunks > 0) {
+            promoteCurrentFrame();
+        }
+        return;
+    }
+
     if (chunkSize > CHUNK_PAYLOAD || chunkSize + HEADER_SIZE > len) return;
     if (frameId != currentFrameId) {
         /* New frame arrived — promote previous partial frame if >50% received */
