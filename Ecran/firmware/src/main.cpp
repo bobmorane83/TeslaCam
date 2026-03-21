@@ -48,6 +48,7 @@ static const char *AP_SSID = "TeslaCam";
 static const IPAddress STATIC_IP(192, 168, 4, 2);
 static const IPAddress GATEWAY(192, 168, 4, 1);
 static const IPAddress SUBNET(255, 255, 255, 0);
+#define WIFI_CHANNEL 1  // WiFi channel (must match Camera + Bridge)
 
 #define UDP_PORT       5000
 #define HEADER_SIZE    8
@@ -823,8 +824,8 @@ void udpRecvTask(void *pvParameters);
 void startWiFi() {
     WiFi.mode(WIFI_STA);
 
-    /* Initialize ESP-NOW early on channel 6 (bridge channel) */
-    esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
+    /* Initialize ESP-NOW early on configured channel */
+    esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
     initESPNOW();
 
     WiFi.config(STATIC_IP, GATEWAY, SUBNET);

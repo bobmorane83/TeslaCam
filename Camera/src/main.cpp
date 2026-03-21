@@ -18,6 +18,7 @@ static const char *AP_SSID = "TeslaCam";
 static const IPAddress AP_IP(192, 168, 4, 1);
 static const IPAddress AP_GW(192, 168, 4, 1);
 static const IPAddress AP_MASK(255, 255, 255, 0);
+#define WIFI_CHANNEL 1  // WiFi channel (must match Bridge + Display)
 
 // ── Receiver ────────────────────────────────────────────────────────────────────
 static const uint16_t  RECEIVER_PORT = 5000;
@@ -117,7 +118,7 @@ bool initCamera() {
 void startSoftAP() {
     WiFi.mode(WIFI_AP);
     WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
-    WiFi.softAP(AP_SSID, nullptr, 6);  // Channel 6 (matches Bridge ESP-NOW)
+    WiFi.softAP(AP_SSID, nullptr, WIFI_CHANNEL);  // Must match Bridge + Display
     Serial.printf("[WIFI] SoftAP started – SSID: %s  IP: %s\n",
                   AP_SSID, WiFi.softAPIP().toString().c_str());
 }

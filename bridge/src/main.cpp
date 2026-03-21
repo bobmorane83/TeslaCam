@@ -32,7 +32,7 @@
 // ───────────────────────────────────────────────────────────────────────────
 #define AP_SSID           "bridge"
 #define AP_PASSWORD       "teslamodel3"
-#define AP_CHANNEL        6      // Channel 6: less congested than 1
+#define AP_CHANNEL        1      // WiFi channel (must match Camera + Display)
 #define AP_MAX_CLIENTS    4
 #define AP_BEACON_MS      100    // Beacon interval (default 100ms)
 #define WIFI_TX_POWER     78     // 19.5 dBm (max). Value = dBm * 4
