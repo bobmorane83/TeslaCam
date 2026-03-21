@@ -277,6 +277,7 @@ void streamTask(void *pvParameters) {
                 Serial.println("[STREAM] Paused — STOP received");
                 wasStreaming = false;
                 setSensorSleep(true);
+                neopixelWrite(48, 0, 0, 0);
             }
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
@@ -285,6 +286,7 @@ void streamTask(void *pvParameters) {
         // Heartbeat timeout check during streaming
         if (millis() - lastCtrlTime > CTRL_TIMEOUT_MS) {
             streamEnabled = false;
+            neopixelWrite(48, 0, 0, 0);
             Serial.println("[CTRL] Heartbeat timeout — streaming disabled");
             continue;
         }
@@ -297,6 +299,7 @@ void streamTask(void *pvParameters) {
             }
             // Wake sensor and let it stabilise before capturing
             setSensorSleep(false);
+            neopixelWrite(48, 0, 20, 0);  // Dim green
             vTaskDelay(pdMS_TO_TICKS(200));
             // Drain stale ctrl commands
             if (ctrl_sock >= 0) {
@@ -339,7 +342,7 @@ void setup() {
     Serial.println("\n=== TeslaCam – Camera (SoftAP + UDP) ===");
 
     pinMode(48, OUTPUT);
-    digitalWrite(48, LOW);
+    neopixelWrite(48, 0, 0, 0);  // RGB LED off
     pinMode(2, OUTPUT);
     digitalWrite(2, LOW);
 
