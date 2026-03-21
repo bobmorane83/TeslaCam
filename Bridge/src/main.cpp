@@ -174,7 +174,7 @@ void flushUDPBuffer(void);
 void updateLED(void);
 void printStatistics(void);
 void onESPNOWSend(const uint8_t* mac_addr, esp_now_send_status_t status);
-void onESPNOWReceive(const uint8_t* mac_addr, const uint8_t* data, int data_len);
+void onESPNOWReceive(const esp_now_recv_info_t *recv_info, const uint8_t* data, int data_len);
 void shutdownAPAndStartESPNOW(void);
 void onWiFiEvent(WiFiEvent_t event);
 
@@ -616,7 +616,7 @@ void onESPNOWSend(const uint8_t* mac_addr, esp_now_send_status_t status) {
     }
 }
 
-void onESPNOWReceive(const uint8_t* mac_addr, const uint8_t* data, int data_len) {
+void onESPNOWReceive(const esp_now_recv_info_t *recv_info, const uint8_t* data, int data_len) {
     if (ap_active) LOG_DEBUG("ESP_NOW RX from peer");
 }
 
