@@ -108,10 +108,12 @@ typedef struct __attribute__((packed)) {
 #define CAN_ID_SPEED     0x257
 #define CAN_ID_GEAR      0x118
 #define CAN_ID_RANGE_SOC 0x33A
-#define CAN_ID_BATT_TEMP 0x312
-#define CAN_ID_REAR_PWR  0x266
+#define CAN_ID_BATT_TEMP   0x312
+#define CAN_ID_COOLANT_TEMP 0x321
+#define CAN_ID_REAR_PWR    0x266
 #define CAN_ID_FRONT_PWR 0x2E5
 #define CAN_ID_BMS_SOC   0x292
+#define CAN_ID_UTC_TIME  0x318
 #define CAN_ID_HEARTBEAT 0xFFF
 
 #define GEAR_INVALID 0
@@ -128,9 +130,14 @@ static volatile struct {
     uint16_t rangeKm;
     float    battTempMax;
     float    battTempMin;
+    float    coolantTemp;
+    bool     battTempReceived;
     float    rearPowerKw;
     float    frontPowerKw;
-} canData = { 0, GEAR_P, 0, 0, 0.0f, 0.0f, 0.0f, 0.0f };
+    uint8_t  utcHour;
+    uint8_t  utcMinute;
+    bool     timeReceived;
+} canData = { 0, GEAR_P, 0, 0, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0, 0, false };
 
 #define BRIDGE_TIMEOUT_MS 5000
 static volatile unsigned long lastBridgeMsg = 0;
@@ -203,6 +210,7 @@ static lv_obj_t *arcBatt;
 /* Labels */
 static lv_obj_t *lblSpeed;
 static lv_obj_t *lblSpeedUnit;
+static lv_obj_t *lblTime;
 static lv_obj_t *lblRange;
 static lv_obj_t *lblRangeUnit;
 static lv_obj_t *lblRangeLbl;
@@ -401,6 +409,14 @@ static void createDashboard(void) {
         lv_obj_center(gearLabel);
     }
 
+    /* ── Time (above speed) ── */
+    lblTime = lv_label_create(scr);
+    lv_label_set_text(lblTime, "--:--");
+    lv_obj_set_style_text_font(lblTime, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(lblTime, COL_WHITE, 0);
+    lv_obj_set_style_text_align(lblTime, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lblTime, LV_ALIGN_CENTER, 0, -80);
+
     /* ── Speed value (large, centered) ── */
     lblSpeed = lv_label_create(scr);
     lv_label_set_text(lblSpeed, "0");
@@ -575,17 +591,17 @@ static void updateDashboard(void) {
     }
     lv_obj_align(lblRange, LV_ALIGN_CENTER, -72, -8);
 
-    /* Battery temp (average of min and max pack temperature) */
-    if (noConnection) {
+    /* Battery temp (coolant inlet temperature — closest to pack average) */
+    if (noConnection || !canData.battTempReceived) {
         lv_label_set_text(lblTemp, "-");
         lv_obj_set_style_text_color(lblTemp, COL_GREY, 0);
         lv_obj_set_style_text_color(lblTempUnit, COL_GREY, 0);
     } else {
-        float battTempAvg = (canData.battTempMin + canData.battTempMax) / 2.0f;
+        float battTemp = canData.coolantTemp;
         char buf[6];
-        snprintf(buf, sizeof(buf), "%d", (int)(battTempAvg + 0.5f));
+        snprintf(buf, sizeof(buf), "%d", (int)(battTemp + 0.5f));
         lv_label_set_text(lblTemp, buf);
-        lv_color_t tc = lvTempColor(battTempAvg);
+        lv_color_t tc = lvTempColor(battTemp);
         lv_obj_set_style_text_color(lblTemp, tc, 0);
         lv_obj_set_style_text_color(lblTempUnit, tc, 0);
     }
@@ -621,6 +637,18 @@ static void updateDashboard(void) {
         lv_color_t kwCol = (regenKwSmooth < 0.2f) ? COL_TEXTDIM : COL_TEAL;
         lv_obj_set_style_text_color(lblRegenKw, kwCol, 0);
         lv_obj_align(lblRegenKw, LV_ALIGN_BOTTOM_MID, 34, -30);
+    }
+
+    /* Time (UTC+1 for France CET) */
+    if (canData.timeReceived && !noConnection) {
+        int localHour = (canData.utcHour + 1) % 24;
+        char buf[6];
+        snprintf(buf, sizeof(buf), "%02d:%02d", localHour, canData.utcMinute);
+        lv_label_set_text(lblTime, buf);
+        lv_obj_set_style_text_color(lblTime, COL_WHITE, 0);
+    } else {
+        lv_label_set_text(lblTime, "--:--");
+        lv_obj_set_style_text_color(lblTime, COL_GREY, 0);
     }
 
     /* Connection dots */
@@ -668,20 +696,30 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
         break;
 
     case CAN_ID_RANGE_SOC:
-        if (m->dlc >= 7) {
+        if (m->dlc >= 8) {
             uint16_t rangeMi = m->data[0] | ((uint16_t)(m->data[1] & 0x03) << 8);
             canData.rangeKm = (uint16_t)(rangeMi * 1.609f + 0.5f);
-            uint8_t socRaw = (m->data[6]) & 0x7F;
-            if (socRaw <= 100) canData.soc = socRaw;
+            uint8_t uiSoc = (m->data[6]) & 0x7F;
+            uint8_t uiSoe = (m->data[7]) & 0x7F;
+            Serial.printf("[CAN] 0x33A bytes: %02X %02X %02X %02X %02X %02X %02X %02X  UI_SOC=%u UI_uSOE=%u\n",
+                m->data[0], m->data[1], m->data[2], m->data[3],
+                m->data[4], m->data[5], m->data[6], m->data[7], uiSoc, uiSoe);
+            /* Use UI_SOC if valid (1-100), otherwise fall through to SOCUI292 */
+            if (uiSoc >= 1 && uiSoc <= 100) canData.soc = uiSoc;
         }
         break;
 
     case CAN_ID_BMS_SOC:
-        if (m->dlc >= 3) {
-            uint16_t raw = ((m->data[1] >> 2) & 0x3F) | ((uint16_t)m->data[2] << 6);
-            raw &= 0x3FF;
-            float socF = raw * 0.1f;
-            if (socF <= 100.0f) canData.soc = (uint8_t)(socF + 0.5f);
+        if (m->dlc >= 4) {
+            /* SOCUI292: bit 10, 10 bits, factor 0.1 — raw BMS SoC includes ~5% bottom buffer */
+            uint16_t rawSoc = ((m->data[1] >> 2) & 0x3F) | ((uint16_t)(m->data[2] & 0x0F) << 6);
+            float socFloat = rawSoc * 0.1f;
+            /* Apply buffer correction: bottom ~5%, no degradation (health 100%) */
+            float displayedSoc = (socFloat - 5.0f) / 95.0f * 100.0f;
+            if (displayedSoc < 0.0f) displayedSoc = 0.0f;
+            if (displayedSoc > 100.0f) displayedSoc = 100.0f;
+            /* Only use SOCUI292 as fallback if UI_SOC hasn't been set */
+            if (canData.soc == 0) canData.soc = (uint8_t)(displayedSoc + 0.5f);
         }
         break;
 
@@ -696,9 +734,26 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
             uint16_t rawMax = ((m->data[6] >> 5) & 0x07) | ((uint16_t)m->data[7] << 3);
             rawMax &= 0x1FF;
             canData.battTempMax = rawMax * 0.25f - 25.0f;
+
+            Serial.printf("[CAN] 0x312 raw: %02X %02X %02X %02X %02X %02X %02X %02X → min=%.1f max=%.1f\n",
+                          m->data[0], m->data[1], m->data[2], m->data[3],
+                          m->data[4], m->data[5], m->data[6], m->data[7],
+                          canData.battTempMin, canData.battTempMax);
         }
         break;
     }
+
+    case CAN_ID_COOLANT_TEMP:
+        if (m->dlc >= 2) {
+            /* VCFRONT_tempCoolantBatInlet: bit 0, 10 bits, ×0.125 −40°C */
+            uint16_t raw = m->data[0] | ((uint16_t)(m->data[1] & 0x03) << 8);
+            float temp = raw * 0.125f - 40.0f;
+            if (raw != 0x3FF) {  /* 1023 = SNA */
+                canData.coolantTemp = temp;
+                canData.battTempReceived = true;
+            }
+        }
+        break;
 
     case CAN_ID_REAR_PWR:
         if (m->dlc >= 2) {
@@ -713,6 +768,14 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
             uint16_t raw = m->data[0] | ((uint16_t)(m->data[1] & 0x07) << 8);
             int16_t val = (raw & 0x400) ? (raw | 0xF800) : raw;
             canData.frontPowerKw = val * 0.5f;
+        }
+        break;
+
+    case CAN_ID_UTC_TIME:
+        if (m->dlc >= 6) {
+            canData.utcHour   = m->data[3];  // UTChour318: byte 3
+            canData.utcMinute = m->data[5];  // UTCminutes318: byte 5
+            canData.timeReceived = true;
         }
         break;
 
