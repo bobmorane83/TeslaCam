@@ -142,6 +142,7 @@ static volatile struct {
 #define BRIDGE_TIMEOUT_MS 5000
 static volatile unsigned long lastBridgeMsg = 0;
 static volatile bool bridgeEverSeen = false;
+static volatile bool espNowPaused = false;
 
 static float regenKwSmooth = 0;
 #define MAX_REGEN_KW 50.0f
@@ -673,6 +674,7 @@ static void updateDashboard(void) {
  *  ESP-NOW RECEIVE CALLBACK
  * ====================================================================== */
 static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+    if (espNowPaused) return;
     if ((size_t)len != sizeof(ESP_CAN_Message_t)) return;
     const ESP_CAN_Message_t *m = (const ESP_CAN_Message_t *)data;
 
@@ -1069,18 +1071,20 @@ void loop() {
         streamActive = !streamActive;
         lastToggleMs = now;
         if (streamActive) {
+            espNowPaused = true;
             sendCtrlCommand("STRT");
             lastCtrlSendMs = now;
             lastFrameTime = now;
             firstFrameReceived = false;
-            Serial.println("[TOUCH] Camera ON");
+            Serial.println("[TOUCH] Camera ON — ESP-NOW paused");
         } else {
+            espNowPaused = false;
             sendCtrlCommand("STOP");
             lastCtrlSendMs = now;
             firstFrameReceived = false;
             /* Force LVGL full redraw when returning to dashboard */
             lv_obj_invalidate(lv_scr_act());
-            Serial.println("[TOUCH] Camera OFF");
+            Serial.println("[TOUCH] Camera OFF — ESP-NOW resumed");
         }
     }
     touchedPrev = touchedNow;
