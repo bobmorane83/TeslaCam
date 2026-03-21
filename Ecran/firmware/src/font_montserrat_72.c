@@ -1,7 +1,7 @@
 /*******************************************************************************
  * Size: 72 px
  * Bpp: 4
- * Opts: --font /Users/macbook/Developpement/Tesla/TeslaCam/Ecran/firmware/.pio/libdeps/jc3636w518c/lvgl/scripts/built_in_font/Montserrat-Medium.ttf --size 72 --bpp 4 --format lvgl --symbols 0123456789  --no-compress -o /Users/macbook/Developpement/Tesla/TeslaCam/Ecran/firmware/src/font_montserrat_72.c
+ * Opts: --bpp 4 --size 72 --font Ecran/firmware/.pio/libdeps/jc3636w518c/lvgl/scripts/built_in_font/Montserrat-Medium.ttf -r 0x20,0x2D,0x30-0x39 --format lvgl -o Ecran/firmware/src/font_montserrat_72.c --no-compress
  ******************************************************************************/
 
 #ifdef LV_LVGL_H_INCLUDE_SIMPLE
@@ -23,6 +23,17 @@
 /*Store the image of the glyphs*/
 static LV_ATTRIBUTE_LARGE_CONST const uint8_t glyph_bitmap[] = {
     /* U+0020 " " */
+
+    /* U+002D "-" */
+    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0xef, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xf7, 0xef, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xf7, 0xef, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf7,
+    0xef, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xf7, 0xef, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xf7, 0xef, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xf7,
 
     /* U+0030 "0" */
     0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
@@ -1300,33 +1311,36 @@ static LV_ATTRIBUTE_LARGE_CONST const uint8_t glyph_bitmap[] = {
 static const lv_font_fmt_txt_glyph_dsc_t glyph_dsc[] = {
     {.bitmap_index = 0, .adv_w = 0, .box_w = 0, .box_h = 0, .ofs_x = 0, .ofs_y = 0} /* id = 0 reserved */,
     {.bitmap_index = 0, .adv_w = 310, .box_w = 0, .box_h = 0, .ofs_x = 0, .ofs_y = 0},
-    {.bitmap_index = 0, .adv_w = 768, .box_w = 42, .box_h = 53, .ofs_x = 3, .ofs_y = -1},
-    {.bitmap_index = 1113, .adv_w = 426, .box_w = 20, .box_h = 51, .ofs_x = 0, .ofs_y = 0},
-    {.bitmap_index = 1623, .adv_w = 661, .box_w = 38, .box_h = 52, .ofs_x = 1, .ofs_y = 0},
-    {.bitmap_index = 2611, .adv_w = 659, .box_w = 38, .box_h = 52, .ofs_x = 0, .ofs_y = -1},
-    {.bitmap_index = 3599, .adv_w = 771, .box_w = 46, .box_h = 51, .ofs_x = 2, .ofs_y = 0},
-    {.bitmap_index = 4772, .adv_w = 661, .box_w = 38, .box_h = 52, .ofs_x = 1, .ofs_y = -1},
-    {.bitmap_index = 5760, .adv_w = 711, .box_w = 40, .box_h = 53, .ofs_x = 3, .ofs_y = -1},
-    {.bitmap_index = 6820, .adv_w = 689, .box_w = 39, .box_h = 51, .ofs_x = 2, .ofs_y = 0},
-    {.bitmap_index = 7815, .adv_w = 742, .box_w = 41, .box_h = 53, .ofs_x = 3, .ofs_y = -1},
-    {.bitmap_index = 8902, .adv_w = 711, .box_w = 39, .box_h = 53, .ofs_x = 2, .ofs_y = -1}
+    {.bitmap_index = 0, .adv_w = 441, .box_w = 20, .box_h = 7, .ofs_x = 4, .ofs_y = 17},
+    {.bitmap_index = 70, .adv_w = 768, .box_w = 42, .box_h = 53, .ofs_x = 3, .ofs_y = -1},
+    {.bitmap_index = 1183, .adv_w = 426, .box_w = 20, .box_h = 51, .ofs_x = 0, .ofs_y = 0},
+    {.bitmap_index = 1693, .adv_w = 661, .box_w = 38, .box_h = 52, .ofs_x = 1, .ofs_y = 0},
+    {.bitmap_index = 2681, .adv_w = 659, .box_w = 38, .box_h = 52, .ofs_x = 0, .ofs_y = -1},
+    {.bitmap_index = 3669, .adv_w = 771, .box_w = 46, .box_h = 51, .ofs_x = 2, .ofs_y = 0},
+    {.bitmap_index = 4842, .adv_w = 661, .box_w = 38, .box_h = 52, .ofs_x = 1, .ofs_y = -1},
+    {.bitmap_index = 5830, .adv_w = 711, .box_w = 40, .box_h = 53, .ofs_x = 3, .ofs_y = -1},
+    {.bitmap_index = 6890, .adv_w = 689, .box_w = 39, .box_h = 51, .ofs_x = 2, .ofs_y = 0},
+    {.bitmap_index = 7885, .adv_w = 742, .box_w = 41, .box_h = 53, .ofs_x = 3, .ofs_y = -1},
+    {.bitmap_index = 8972, .adv_w = 711, .box_w = 39, .box_h = 53, .ofs_x = 2, .ofs_y = -1}
 };
 
 /*---------------------
  *  CHARACTER MAPPING
  *--------------------*/
 
-
+static const uint16_t unicode_list_0[] = {
+    0x0, 0xd
+};
 
 /*Collect the unicode lists and glyph_id offsets*/
 static const lv_font_fmt_txt_cmap_t cmaps[] =
 {
     {
-        .range_start = 32, .range_length = 1, .glyph_id_start = 1,
-        .unicode_list = NULL, .glyph_id_ofs_list = NULL, .list_length = 0, .type = LV_FONT_FMT_TXT_CMAP_FORMAT0_TINY
+        .range_start = 32, .range_length = 14, .glyph_id_start = 1,
+        .unicode_list = unicode_list_0, .glyph_id_ofs_list = NULL, .list_length = 2, .type = LV_FONT_FMT_TXT_CMAP_SPARSE_TINY
     },
     {
-        .range_start = 48, .range_length = 10, .glyph_id_start = 2,
+        .range_start = 48, .range_length = 10, .glyph_id_start = 3,
         .unicode_list = NULL, .glyph_id_ofs_list = NULL, .list_length = 0, .type = LV_FONT_FMT_TXT_CMAP_FORMAT0_TINY
     }
 };
@@ -1339,28 +1353,30 @@ static const lv_font_fmt_txt_cmap_t cmaps[] =
 /*Map glyph_ids to kern left classes*/
 static const uint8_t kern_left_class_mapping[] =
 {
-    0, 0, 1, 0, 2, 3, 4, 5,
-    6, 7, 0, 1
+    0, 0, 1, 2, 0, 3, 4, 5,
+    6, 7, 8, 0, 2
 };
 
 /*Map glyph_ids to kern right classes*/
 static const uint8_t kern_right_class_mapping[] =
 {
     0, 0, 1, 2, 3, 4, 5, 6,
-    1, 7, 8, 9
+    7, 2, 8, 9, 10
 };
 
 /*Kern values between classes*/
 static const int8_t kern_class_values[] =
 {
-    0, -3, -3, -12, 0, 0, -8, 0,
-    0, -3, 0, 0, 0, -22, 0, -3,
-    0, 0, 0, 0, -6, -6, 0, -12,
-    -14, 0, 0, 0, -29, -3, -14, 0,
-    -3, -54, 12, -8, 0, 0, -6, -6,
-    0, -6, -15, 0, 0, 0, 0, 0,
-    0, 0, 0, -8, 0, 0, -23, 12,
-    0, -9, -75, -21, 0, -21, 0
+    3, 8, -21, -15, -23, 8, 0, -12,
+    0, 0, 8, 0, -3, -3, -12, 0,
+    0, -8, 0, 0, -8, -3, 0, 0,
+    0, -22, 0, -3, 0, 0, 0, 0,
+    0, -6, -6, 0, -12, -14, 0, 0,
+    12, 0, -29, -3, -14, 0, -3, -54,
+    12, -8, 0, 0, 0, -6, -6, 0,
+    -6, -15, 0, 0, 6, 0, 0, 0,
+    0, 0, 0, -8, 0, 0, -58, -23,
+    12, 0, -9, -75, -21, 0, -21, 0
 };
 
 
@@ -1370,8 +1386,8 @@ static const lv_font_fmt_txt_kern_classes_t kern_classes =
     .class_pair_values   = kern_class_values,
     .left_class_mapping  = kern_left_class_mapping,
     .right_class_mapping = kern_right_class_mapping,
-    .left_class_cnt      = 7,
-    .right_class_cnt     = 9,
+    .left_class_cnt      = 8,
+    .right_class_cnt     = 10,
 };
 
 /*--------------------

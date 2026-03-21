@@ -127,9 +127,10 @@ static volatile struct {
     uint8_t  soc;
     uint16_t rangeKm;
     float    battTempMax;
+    float    battTempMin;
     float    rearPowerKw;
     float    frontPowerKw;
-} canData = { 0, GEAR_P, 0, 0, 25.0f, 0.0f, 0.0f };
+} canData = { 0, GEAR_P, 0, 0, 0.0f, 0.0f, 0.0f, 0.0f };
 
 #define BRIDGE_TIMEOUT_MS 5000
 static volatile unsigned long lastBridgeMsg = 0;
@@ -170,27 +171,16 @@ static const lv_color_t COL_WHITE    = MKCOL(255, 255, 255);
 static const lv_color_t COL_TEXTDIM  = MKCOL(58, 90, 112);
 static const lv_color_t COL_GREEN    = MKCOL(0, 255, 0);
 
+static const lv_color_t COL_GREY     = MKCOL(80, 80, 80);
+
 static lv_color_t lvSpeedColor(int speed) {
-    float t = speed / 180.0f;
-    if (t > 1.0f) t = 1.0f;
-    uint8_t r, g, b;
-    if (t < 0.55f) {
-        float f = t / 0.55f;
-        r = (uint8_t)(f * 255);
-        g = 230 + (uint8_t)((1.0f - f) * 25);
-        b = (uint8_t)((1.0f - f) * 200);
-    } else {
-        float f = (t - 0.55f) / 0.45f;
-        r = 255;
-        g = (uint8_t)((1.0f - f) * 200);
-        b = 0;
-    }
-    return lv_color_make(r, g, b);
+    (void)speed;
+    return COL_GREEN;
 }
 
 static lv_color_t lvSocColor(uint8_t soc) {
-    if (soc > 50) return COL_TEAL;
-    if (soc > 20) return COL_AMBER;
+    if (soc > 20) return COL_GREEN;
+    if (soc > 10) return COL_AMBER;
     return COL_RED;
 }
 
@@ -533,23 +523,31 @@ static void createDashboard(void) {
  *  UPDATE DASHBOARD FROM CAN DATA
  * ====================================================================== */
 static void updateDashboard(void) {
+    unsigned long now = millis();
+    bool bridgeConnected = bridgeEverSeen && (now - lastBridgeMsg < BRIDGE_TIMEOUT_MS);
+    bool noConnection = !bridgeEverSeen || !bridgeConnected;
+
     int speed = canData.uiSpeed;
     if (speed > 180) speed = 180;
     uint8_t soc = canData.soc;
     uint8_t gear = canData.gear;
 
     /* Speed arc */
-    lv_arc_set_value(arcSpeed, speed);
+    lv_arc_set_value(arcSpeed, noConnection ? 0 : speed);
     lv_color_t sCol = lvSpeedColor(speed);
     lv_obj_set_style_arc_color(arcSpeed, sCol, LV_PART_INDICATOR);
 
     /* Battery arc */
-    lv_arc_set_value(arcBatt, soc);
+    lv_arc_set_value(arcBatt, noConnection ? 0 : soc);
     lv_color_t bCol = lvSocColor(soc);
     lv_obj_set_style_arc_color(arcBatt, bCol, LV_PART_INDICATOR);
 
     /* Gear indicator */
-    {
+    if (noConnection) {
+        lv_label_set_text(gearLabel, "");
+        lv_obj_set_style_text_color(gearLabel, COL_GREY, 0);
+        lv_obj_set_style_border_color(gearBox, COL_GREY, 0);
+    } else {
         const char *gLetters[] = { "?", "P", "R", "N", "D" };
         const lv_color_t gColors[] = { COL_TEAL_VDIM, COL_BLUE, COL_RED, COL_AMBER, COL_TEAL };
         int idx = (gear >= 1 && gear <= 4) ? gear : 0;
@@ -559,40 +557,52 @@ static void updateDashboard(void) {
     }
 
     /* Speed number */
-    {
+    if (noConnection) {
+        lv_label_set_text(lblSpeed, "-");
+    } else {
         char buf[4];
         snprintf(buf, sizeof(buf), "%d", (int)canData.uiSpeed);
         lv_label_set_text(lblSpeed, buf);
     }
 
     /* Range */
-    {
+    if (noConnection) {
+        lv_label_set_text(lblRange, "-");
+    } else {
         char buf[6];
         snprintf(buf, sizeof(buf), "%d", (int)canData.rangeKm);
         lv_label_set_text(lblRange, buf);
-        lv_obj_align(lblRange, LV_ALIGN_CENTER, -72, -8);
     }
+    lv_obj_align(lblRange, LV_ALIGN_CENTER, -72, -8);
 
-    /* Battery temp */
-    {
+    /* Battery temp (average of min and max pack temperature) */
+    if (noConnection) {
+        lv_label_set_text(lblTemp, "-");
+        lv_obj_set_style_text_color(lblTemp, COL_GREY, 0);
+        lv_obj_set_style_text_color(lblTempUnit, COL_GREY, 0);
+    } else {
+        float battTempAvg = (canData.battTempMin + canData.battTempMax) / 2.0f;
         char buf[6];
-        snprintf(buf, sizeof(buf), "%d", (int)(canData.battTempMax + 0.5f));
+        snprintf(buf, sizeof(buf), "%d", (int)(battTempAvg + 0.5f));
         lv_label_set_text(lblTemp, buf);
-        lv_color_t tc = lvTempColor(canData.battTempMax);
+        lv_color_t tc = lvTempColor(battTempAvg);
         lv_obj_set_style_text_color(lblTemp, tc, 0);
         lv_obj_set_style_text_color(lblTempUnit, tc, 0);
-        lv_obj_align(lblTemp, LV_ALIGN_CENTER, 72, -8);
     }
+    lv_obj_align(lblTemp, LV_ALIGN_CENTER, 72, -8);
 
     /* SoC */
-    {
+    if (noConnection) {
+        lv_label_set_text(lblSoc, "-%");
+        lv_obj_set_style_text_color(lblSoc, COL_GREY, 0);
+    } else {
         char buf[5];
         snprintf(buf, sizeof(buf), "%d%%", soc);
         lv_label_set_text(lblSoc, buf);
         lv_color_t sc = lvSocColor(soc);
         lv_obj_set_style_text_color(lblSoc, sc, 0);
-        lv_obj_align(lblSoc, LV_ALIGN_BOTTOM_MID, 0, -74);
     }
+    lv_obj_align(lblSoc, LV_ALIGN_BOTTOM_MID, 0, -74);
 
     /* Regen */
     {
@@ -615,10 +625,9 @@ static void updateDashboard(void) {
 
     /* Connection dots */
     {
-        unsigned long now = millis();
         bool blinkOn = (now / 500) % 2 == 0;
         lv_color_t bDotCol;
-        if (bridgeEverSeen && (now - lastBridgeMsg < BRIDGE_TIMEOUT_MS))
+        if (bridgeConnected)
             bDotCol = COL_GREEN;
         else if (!bridgeEverSeen)
             bDotCol = blinkOn ? COL_AMBER : COL_BG;
@@ -626,7 +635,8 @@ static void updateDashboard(void) {
             bDotCol = COL_RED;
         lv_obj_set_style_bg_color(dotBridge, bDotCol, 0);
 
-        lv_color_t cDotCol = (WiFi.status() == WL_CONNECTED) ? COL_GREEN : COL_RED;
+        /* Camera dot: green when WiFi connected, red otherwise */
+        lv_color_t cDotCol = wifiConnected ? COL_GREEN : COL_RED;
         lv_obj_set_style_bg_color(dotCamera, cDotCol, 0);
     }
 }
@@ -677,9 +687,15 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
 
     case CAN_ID_BATT_TEMP: {
         if (m->dlc >= 8) {
-            uint16_t raw = ((m->data[6] >> 5) & 0x07) | ((uint16_t)m->data[7] << 3);
-            raw &= 0x1FF;
-            canData.battTempMax = raw * 0.25f - 25.0f;
+            /* BMSminPackTemperature: bit 44, 9 bits, ×0.25 −25°C */
+            uint16_t rawMin = ((m->data[5] >> 4) & 0x0F) | ((uint16_t)(m->data[6] & 0x1F) << 4);
+            rawMin &= 0x1FF;
+            canData.battTempMin = rawMin * 0.25f - 25.0f;
+
+            /* BMSmaxPackTemperature: bit 53, 9 bits, ×0.25 −25°C */
+            uint16_t rawMax = ((m->data[6] >> 5) & 0x07) | ((uint16_t)m->data[7] << 3);
+            rawMax &= 0x1FF;
+            canData.battTempMax = rawMax * 0.25f - 25.0f;
         }
         break;
     }
@@ -739,6 +755,11 @@ void udpRecvTask(void *pvParameters);
 
 void startWiFi() {
     WiFi.mode(WIFI_STA);
+
+    /* Initialize ESP-NOW early on channel 6 (bridge channel) */
+    esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
+    initESPNOW();
+
     WiFi.config(STATIC_IP, GATEWAY, SUBNET);
     WiFi.begin(AP_SSID);
     WiFi.setSleep(false);
@@ -747,7 +768,6 @@ void startWiFi() {
 
 void setupNetwork() {
     if (networkReady) return;
-    initESPNOW();
 
     udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (udp_sock >= 0) {
@@ -880,9 +900,9 @@ static void drawStatusDotsOverlay() {
         bCol16 = blinkOn ? 0xFD40 : 0x0000; // AMBER or BLACK
     else
         bCol16 = 0xF9A6; // RED
-    gfx->fillCircle(CX - 8, SCREEN_H - 8, 3, bCol16);
+    gfx->fillCircle(CX - 6, SCREEN_H - 6, 2, bCol16);
     uint16_t cCol16 = (WiFi.status() == WL_CONNECTED) ? 0x07E0 : 0xF9A6;
-    gfx->fillCircle(CX + 8, SCREEN_H - 8, 3, cCol16);
+    gfx->fillCircle(CX + 6, SCREEN_H - 6, 2, cCol16);
 }
 
 /* ======================================================================
