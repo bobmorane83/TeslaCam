@@ -117,7 +117,7 @@ typedef struct __attribute__((packed)) {
 #define CAN_ID_FRONT_PWR 0x2E5
 #define CAN_ID_BMS_SOC   0x292
 #define CAN_ID_UTC_TIME  0x318
-#define CAN_ID_HVAC_STATUS 0x243
+#define CAN_ID_THS_STATUS  0x383
 #define CAN_ID_HEARTBEAT 0xFFF
 
 #define GEAR_INVALID 0
@@ -807,7 +807,6 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
         if (m->dlc >= 6) {
             /* VCFRONT_tempAmbientFiltered: bit 40, 8 bits, ×0.5 −40°C */
             uint8_t raw = m->data[5];
-            Serial.printf("[CAN] 0x321 outdoor: raw=%u → %.1f°C\n", raw, raw * 0.5f - 40.0f);
             if (raw != 0) {  /* 0 = SNA */
                 canData.outdoorTemp = raw * 0.5f - 40.0f;
                 canData.outdoorTempReceived = true;
@@ -815,23 +814,14 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
         }
         break;
 
-    case CAN_ID_HVAC_STATUS:
-        if (m->dlc >= 6) {
-            uint8_t muxIdx = m->data[0] & 0x03;
-            Serial.printf("[CAN] 0x243 mux=%u data=%02X %02X %02X %02X %02X %02X %02X %02X\n",
-                          muxIdx, m->data[0], m->data[1], m->data[2], m->data[3],
-                          m->data[4], m->data[5], m->data[6], m->data[7]);
-            if (muxIdx == 0) {
-                /* VCRIGHT_hvacCabinTempEst: bit 30, 11 bits, ×0.1 −40°C */
-                uint16_t raw = ((m->data[3] >> 6) & 0x03) |
-                               ((uint16_t)m->data[4] << 2) |
-                               ((uint16_t)(m->data[5] & 0x01) << 10);
-                float temp = raw * 0.1f - 40.0f;
-                Serial.printf("[CAN] 0x243 cabin: raw=%u → %.1f°C\n", raw, temp);
-                if (raw != 0x7FF && temp > -40.0f && temp < 60.0f) {
-                    canData.cabinTemp = temp;
-                    canData.cabinTempReceived = true;
-                }
+    case CAN_ID_THS_STATUS:
+        if (m->dlc >= 2) {
+            /* VCRIGHT_thsTemperature: start_bit 1, 8 bits, LE signed, ×1 −40°C */
+            uint8_t rawU = ((m->data[0] >> 1) & 0x7F) | ((m->data[1] & 0x01) << 7);
+            if (rawU != 128) {  /* 128 = SNA */
+                int8_t rawS = (int8_t)rawU;
+                canData.cabinTemp = rawS - 40.0f;
+                canData.cabinTempReceived = true;
             }
         }
         break;
