@@ -11,6 +11,7 @@
 /* ─── Color ─── */
 #define LV_COLOR_DEPTH     16
 #define LV_COLOR_16_SWAP   0
+#define LV_COLOR_CHROMA_KEY lv_color_hex(0xFF00FF) /* magenta (not green, we use green for glow) */
 
 /* ─── Memory ─── */
 #define LV_MEM_CUSTOM      1
@@ -100,10 +101,10 @@
 #define LV_USE_BAR        1
 #define LV_USE_BTN        1
 #define LV_USE_BTNMATRIX  0
-#define LV_USE_CANVAS     0
+#define LV_USE_CANVAS     1
 #define LV_USE_CHECKBOX   0
 #define LV_USE_DROPDOWN   0
-#define LV_USE_IMG        0
+#define LV_USE_IMG        1
 #define LV_USE_LABEL      1
 #define LV_USE_LINE       1
 #define LV_USE_ROLLER     0

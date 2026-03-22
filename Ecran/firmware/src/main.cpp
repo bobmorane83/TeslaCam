@@ -118,6 +118,8 @@ typedef struct __attribute__((packed)) {
 #define CAN_ID_BMS_SOC   0x292
 #define CAN_ID_UTC_TIME  0x318
 #define CAN_ID_THS_STATUS  0x383
+#define CAN_ID_LEFT_LIGHT  0x3E2
+#define CAN_ID_RIGHT_LIGHT 0x3E3
 #define CAN_ID_HEARTBEAT 0xFFF
 
 #define GEAR_INVALID 0
@@ -145,7 +147,9 @@ static volatile struct {
     bool     outdoorTempReceived;
     float    cabinTemp;
     bool     cabinTempReceived;
-} canData = { 0, GEAR_P, 0, 0, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0, 0, false, 0.0f, false, 0.0f, false };
+    bool     leftTurnOn;
+    bool     rightTurnOn;
+} canData = { 0, GEAR_P, 0, 0, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0, 0, false, 0.0f, false, 0.0f, false, false, false };
 
 #define BRIDGE_TIMEOUT_MS 5000
 static volatile unsigned long lastBridgeMsg = 0;
@@ -249,6 +253,24 @@ static lv_obj_t *dotCamera;
 /* Speed tick lines drawn on a dedicated object */
 static lv_obj_t *tickCanvas;
 
+/* Turn signal halo arcs */
+static lv_obj_t *arcTurnLeft;
+static lv_obj_t *arcTurnRight;
+
+/* Turn signal state */
+static bool turnLeftVisible = false;
+static bool turnRightVisible = false;
+static unsigned long turnLeftOnMs = 0;   // when this blink started showing
+static unsigned long turnRightOnMs = 0;
+#define TURN_REVEAL_MS 150   // time for outside→inside reveal animation
+
+/* Turn signal test sequence — disabled (keep for reference) */
+// static bool turnTestActive = true;
+// static unsigned long turnTestStartMs = 0;
+// #define TURN_TEST_BLINK_MS   500
+// #define TURN_TEST_BLINKS     5
+// #define TURN_TEST_PAUSE_MS   600
+
 /* ── Speed arc angles ── */
 /* LVGL arcs: 0° = right (3 o'clock), CW.
  * Mockup speed: starts at 135° (bottom-left) → 405° (bottom-right) = 270° sweep.
@@ -267,6 +289,82 @@ static lv_obj_t *tickCanvas;
 #define BATT_ARC_RANGE  244
 #define BATT_R_OUTER    121
 #define BATT_ARC_WIDTH  4
+
+/* Turn signal halo: quarter circle (90°), radial gradient via pre-rendered canvas */
+#define TURN_ARC_SPAN    90    // 90° arc = quarter circle
+#define TURN_HALO_WIDTH  90    // gradient depth from edge inward (pixels)
+#define TURN_TIP_FADE    20    // degrees of angular fade at each tip
+
+/* ======================================================================
+ *  TURN SIGNAL HALO — pre-rendered canvas (pixel-perfect smooth gradient)
+ * ====================================================================== */
+static lv_color_t *turnCanvasBufLeft  = NULL;
+static lv_color_t *turnCanvasBufRight = NULL;
+
+/* LV_IMG_CF_TRUE_COLOR_ALPHA: 3 bytes per pixel (2 color + 1 alpha) */
+#define TURN_CANVAS_BPP  LV_IMG_PX_SIZE_ALPHA_BYTE  // 3 bytes/pixel
+#define TURN_CANVAS_SIZE (SCREEN_W * SCREEN_H * TURN_CANVAS_BPP)
+
+/* Pre-render the halo glow for one side into canvas buffer (TRUE_COLOR_ALPHA).
+ * Buffer layout: [color_low, color_high, alpha] per pixel */
+static void prerenderTurnHalo(uint8_t *buf, int side) {
+    float centerDeg = (side == 1) ? 0.0f : 180.0f;
+    float halfSpan = TURN_ARC_SPAN / 2.0f;
+    float tipFade  = (float)TURN_TIP_FADE;
+
+    for (int y = 0; y < SCREEN_H; y++) {
+        for (int x = 0; x < SCREEN_W; x++) {
+            int idx = (y * SCREEN_W + x) * 3;
+            float dx = (float)(x - CX);
+            float dy = (float)(y - CY);
+            float dist = sqrtf(dx * dx + dy * dy);
+            float edgeDist = 180.0f - dist;
+
+            if (edgeDist < 0.0f || edgeDist > TURN_HALO_WIDTH) {
+                buf[idx] = 0; buf[idx + 1] = 0; buf[idx + 2] = 0; // transparent
+                continue;
+            }
+
+            float angle = atan2f(-dy, dx) * 180.0f / M_PI;
+            if (angle < 0.0f) angle += 360.0f;
+
+            float angDist = angle - centerDeg;
+            if (angDist > 180.0f) angDist -= 360.0f;
+            if (angDist < -180.0f) angDist += 360.0f;
+            float absAngDist = fabsf(angDist);
+
+            if (absAngDist > halfSpan) {
+                buf[idx] = 0; buf[idx + 1] = 0; buf[idx + 2] = 0;
+                continue;
+            }
+
+            /* Radial fade: cubic from edge */
+            float rt = edgeDist / TURN_HALO_WIDTH;
+            float radialAlpha = (1.0f - rt);
+            radialAlpha = radialAlpha * radialAlpha * radialAlpha;
+
+            /* Angular fade at tips */
+            float angAlpha = 1.0f;
+            float tipStart = halfSpan - tipFade;
+            if (absAngDist > tipStart) {
+                float tipT = (absAngDist - tipStart) / tipFade;
+                angAlpha = 1.0f - tipT * tipT;
+            }
+
+            float alpha = radialAlpha * angAlpha;
+            if (alpha < 0.0f) alpha = 0.0f;
+            if (alpha > 1.0f) alpha = 1.0f;
+
+            uint8_t a8 = (uint8_t)(alpha * 200.0f);  // max 200 for semi-transparency
+            lv_color_t col = COL_GREEN;
+
+            /* LVGL TRUE_COLOR_ALPHA: byte0 = color low, byte1 = color high, byte2 = alpha */
+            buf[idx]     = col.full & 0xFF;
+            buf[idx + 1] = (col.full >> 8) & 0xFF;
+            buf[idx + 2] = a8;
+        }
+    }
+}
 
 /* ======================================================================
  *  TICK MARK DRAWING (event callback on a transparent obj)
@@ -560,6 +658,36 @@ static void createDashboard(void) {
     lv_obj_set_style_bg_opa(dotCamera, LV_OPA_COVER, 0);
     lv_obj_clear_flag(dotCamera, LV_OBJ_FLAG_CLICKABLE);
 
+    /* ── Turn signal halos (pre-rendered canvases, initially hidden) ── */
+    {
+        turnCanvasBufLeft = (lv_color_t *)heap_caps_malloc(TURN_CANVAS_SIZE, MALLOC_CAP_SPIRAM);
+        turnCanvasBufRight = (lv_color_t *)heap_caps_malloc(TURN_CANVAS_SIZE, MALLOC_CAP_SPIRAM);
+
+        if (turnCanvasBufLeft && turnCanvasBufRight) {
+            Serial.println("[TURN] Pre-rendering halo canvases...");
+            prerenderTurnHalo((uint8_t *)turnCanvasBufLeft, 0);   // left
+            prerenderTurnHalo((uint8_t *)turnCanvasBufRight, 1);  // right
+            Serial.println("[TURN] Halo canvases ready");
+
+            arcTurnLeft = lv_canvas_create(scr);
+            lv_canvas_set_buffer(arcTurnLeft, turnCanvasBufLeft, SCREEN_W, SCREEN_H, LV_IMG_CF_TRUE_COLOR_ALPHA);
+            lv_obj_center(arcTurnLeft);
+            lv_obj_clear_flag(arcTurnLeft, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_flag(arcTurnLeft, LV_OBJ_FLAG_HIDDEN);
+
+            arcTurnRight = lv_canvas_create(scr);
+            lv_canvas_set_buffer(arcTurnRight, turnCanvasBufRight, SCREEN_W, SCREEN_H, LV_IMG_CF_TRUE_COLOR_ALPHA);
+            lv_obj_center(arcTurnRight);
+            lv_obj_clear_flag(arcTurnRight, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_flag(arcTurnRight, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            Serial.println("[TURN] PSRAM alloc failed for halo canvases");
+        }
+    }
+
+    /* Initialize test sequence timer — disabled */
+    // turnTestStartMs = millis();
+
     Serial.println("[LVGL] Dashboard UI created");
 }
 
@@ -717,6 +845,36 @@ static void updateDashboard(void) {
         lv_color_t cDotCol = wifiConnected ? COL_GREEN : COL_RED;
         lv_obj_set_style_bg_color(dotCamera, cDotCol, 0);
     }
+
+    /* Turn signal halo blink */
+    {
+        bool leftOn = canData.leftTurnOn;
+        bool rightOn = canData.rightTurnOn;
+
+        if (leftOn) {
+            if (!turnLeftVisible) {
+                turnLeftOnMs = now;
+                turnLeftVisible = true;
+            }
+            lv_obj_clear_flag(arcTurnLeft, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_invalidate(arcTurnLeft);
+        } else {
+            turnLeftVisible = false;
+            lv_obj_add_flag(arcTurnLeft, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        if (rightOn) {
+            if (!turnRightVisible) {
+                turnRightOnMs = now;
+                turnRightVisible = true;
+            }
+            lv_obj_clear_flag(arcTurnRight, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_invalidate(arcTurnRight);
+        } else {
+            turnRightVisible = false;
+            lv_obj_add_flag(arcTurnRight, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 }
 
 /* ======================================================================
@@ -851,6 +1009,22 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
         break;
 
     case CAN_ID_HEARTBEAT:
+        break;
+
+    case CAN_ID_LEFT_LIGHT:
+        if (m->dlc >= 1) {
+            /* VCLEFT_turnSignalStatus: bit 4, 2 bits — 1=ON */
+            uint8_t status = (m->data[0] >> 4) & 0x03;
+            canData.leftTurnOn = (status == 1);
+        }
+        break;
+
+    case CAN_ID_RIGHT_LIGHT:
+        if (m->dlc >= 1) {
+            /* VCRIGHT_turnSignalStatus: bit 4, 2 bits — 1=ON */
+            uint8_t status = (m->data[0] >> 4) & 0x03;
+            canData.rightTurnOn = (status == 1);
+        }
         break;
     }
 }
