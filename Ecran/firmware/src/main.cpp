@@ -299,7 +299,7 @@ static void drawTicksCb(lv_event_t *e) {
 
         lv_draw_line_dsc_t ldsc;
         lv_draw_line_dsc_init(&ldsc);
-        ldsc.color = major ? COL_TEAL_DIM : COL_TEAL_VDIM;
+        ldsc.color = major ? COL_TEAL : COL_TEAL_DIM;
         ldsc.width = major ? 2 : 1;
         ldsc.opa = LV_OPA_COVER;
         lv_draw_line(draw_ctx, &ldsc, &pts[0], &pts[1]);
@@ -314,7 +314,7 @@ static void drawTicksCb(lv_event_t *e) {
 
             lv_draw_label_dsc_t lbdsc;
             lv_draw_label_dsc_init(&lbdsc);
-            lbdsc.color = COL_TEAL_DIM;
+            lbdsc.color = COL_TEAL;
             lbdsc.font = &lv_font_montserrat_12;
             lbdsc.opa = LV_OPA_COVER;
             lbdsc.align = LV_TEXT_ALIGN_CENTER;
@@ -360,7 +360,7 @@ static void createDashboard(void) {
     lv_obj_remove_style(arcSpeed, NULL, LV_PART_KNOB);
 
     /* Background (dim track) */
-    lv_obj_set_style_arc_color(arcSpeed, COL_TEAL_VDIM, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(arcSpeed, COL_TEAL_DIM, LV_PART_MAIN);
     lv_obj_set_style_arc_width(arcSpeed, SPEED_ARC_WIDTH, LV_PART_MAIN);
     lv_obj_set_style_arc_opa(arcSpeed, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_arc_rounded(arcSpeed, true, LV_PART_MAIN);
@@ -388,7 +388,7 @@ static void createDashboard(void) {
     lv_obj_clear_flag(arcBatt, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_style(arcBatt, NULL, LV_PART_KNOB);
 
-    lv_obj_set_style_arc_color(arcBatt, COL_TEAL_VDIM, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(arcBatt, COL_TEAL_DIM, LV_PART_MAIN);
     lv_obj_set_style_arc_width(arcBatt, BATT_ARC_WIDTH, LV_PART_MAIN);
     lv_obj_set_style_arc_opa(arcBatt, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_arc_rounded(arcBatt, true, LV_PART_MAIN);
@@ -807,6 +807,7 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
         if (m->dlc >= 6) {
             /* VCFRONT_tempAmbientFiltered: bit 40, 8 bits, ×0.5 −40°C */
             uint8_t raw = m->data[5];
+            Serial.printf("[CAN] 0x321 outdoor: raw=%u → %.1f°C\n", raw, raw * 0.5f - 40.0f);
             if (raw != 0) {  /* 0 = SNA */
                 canData.outdoorTemp = raw * 0.5f - 40.0f;
                 canData.outdoorTempReceived = true;
@@ -816,19 +817,20 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
 
     case CAN_ID_HVAC_STATUS:
         if (m->dlc >= 6) {
-            /* Multiplexed: index at bits 0-1 */
             uint8_t muxIdx = m->data[0] & 0x03;
+            Serial.printf("[CAN] 0x243 mux=%u data=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+                          muxIdx, m->data[0], m->data[1], m->data[2], m->data[3],
+                          m->data[4], m->data[5], m->data[6], m->data[7]);
             if (muxIdx == 0) {
                 /* VCRIGHT_hvacCabinTempEst: bit 30, 11 bits, ×0.1 −40°C */
                 uint16_t raw = ((m->data[3] >> 6) & 0x03) |
                                ((uint16_t)m->data[4] << 2) |
                                ((uint16_t)(m->data[5] & 0x01) << 10);
-                if (raw != 0x7FF) {  /* 2047 = likely SNA */
-                    float temp = raw * 0.1f - 40.0f;
-                    if (temp > -40.0f && temp < 60.0f) {
-                        canData.cabinTemp = temp;
-                        canData.cabinTempReceived = true;
-                    }
+                float temp = raw * 0.1f - 40.0f;
+                Serial.printf("[CAN] 0x243 cabin: raw=%u → %.1f°C\n", raw, temp);
+                if (raw != 0x7FF && temp > -40.0f && temp < 60.0f) {
+                    canData.cabinTemp = temp;
+                    canData.cabinTempReceived = true;
                 }
             }
         }
