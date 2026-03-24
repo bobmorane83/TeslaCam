@@ -108,6 +108,9 @@ typedef struct __attribute__((packed)) {
     uint8_t  is_extended;
 } ESP_CAN_Message_t;
 
+/* ── Feature flags ── */
+#define FEATURE_TURN_SIGNAL 0   // Set to 1 to enable turn signal halo
+
 #define CAN_ID_SPEED     0x257
 #define CAN_ID_GEAR      0x118
 #define CAN_ID_RANGE_SOC 0x33A
@@ -118,8 +121,9 @@ typedef struct __attribute__((packed)) {
 #define CAN_ID_BMS_SOC   0x292
 #define CAN_ID_UTC_TIME  0x318
 #define CAN_ID_THS_STATUS  0x383
-#define CAN_ID_LEFT_LIGHT  0x3E2
-#define CAN_ID_RIGHT_LIGHT 0x3E3
+#define CAN_ID_UI_WARNING  0x311
+#define CAN_ID_VCFRONT_LIGHT 0x3F5
+#define CAN_ID_STALK       0x249
 #define CAN_ID_HEARTBEAT 0xFFF
 
 #define GEAR_INVALID 0
@@ -151,7 +155,7 @@ static volatile struct {
     bool     rightTurnOn;
 } canData = { 0, GEAR_P, 0, 0, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0, 0, false, 0.0f, false, 0.0f, false, false, false };
 
-#define BRIDGE_TIMEOUT_MS 5000
+#define BRIDGE_TIMEOUT_MS 10000
 static volatile unsigned long lastBridgeMsg = 0;
 static volatile bool bridgeEverSeen = false;
 static volatile bool espNowPaused = false;
@@ -254,22 +258,24 @@ static lv_obj_t *dotCamera;
 static lv_obj_t *tickCanvas;
 
 /* Turn signal halo arcs */
+#if FEATURE_TURN_SIGNAL
 static lv_obj_t *arcTurnLeft;
 static lv_obj_t *arcTurnRight;
 
 /* Turn signal state */
 static bool turnLeftVisible = false;
 static bool turnRightVisible = false;
-static unsigned long turnLeftOnMs = 0;   // when this blink started showing
+static unsigned long turnLeftOnMs = 0;      // when this blink started showing
 static unsigned long turnRightOnMs = 0;
-#define TURN_REVEAL_MS 150   // time for outside→inside reveal animation
 
-/* Turn signal test sequence — disabled (keep for reference) */
-// static bool turnTestActive = true;
-// static unsigned long turnTestStartMs = 0;
-// #define TURN_TEST_BLINK_MS   500
-// #define TURN_TEST_BLINKS     5
-// #define TURN_TEST_PAUSE_MS   600
+/* Turn signal activation via stalk (0x249) or UI_warning (0x311) */
+enum TurnMode { TURN_OFF = 0, TURN_LEFT_3, TURN_LEFT_CONT, TURN_RIGHT_3, TURN_RIGHT_CONT };
+static volatile TurnMode turnMode = TURN_OFF;
+static volatile unsigned long turnArmedMs = 0;  // when turn was activated
+#define TURN_3BLINK_MS    1500   // 3 blinks × 500ms each
+#define TURN_CONT_MS     30000   // continuous mode timeout (30s)
+#define TURN_REVEAL_MS     150   // reveal animation time
+#endif // FEATURE_TURN_SIGNAL
 
 /* ── Speed arc angles ── */
 /* LVGL arcs: 0° = right (3 o'clock), CW.
@@ -290,6 +296,7 @@ static unsigned long turnRightOnMs = 0;
 #define BATT_R_OUTER    121
 #define BATT_ARC_WIDTH  4
 
+#if FEATURE_TURN_SIGNAL
 /* Turn signal halo: quarter circle (90°), radial gradient via pre-rendered canvas */
 #define TURN_ARC_SPAN    90    // 90° arc = quarter circle
 #define TURN_HALO_WIDTH  90    // gradient depth from edge inward (pixels)
@@ -365,6 +372,7 @@ static void prerenderTurnHalo(uint8_t *buf, int side) {
         }
     }
 }
+#endif // FEATURE_TURN_SIGNAL
 
 /* ======================================================================
  *  TICK MARK DRAWING (event callback on a transparent obj)
@@ -659,6 +667,7 @@ static void createDashboard(void) {
     lv_obj_clear_flag(dotCamera, LV_OBJ_FLAG_CLICKABLE);
 
     /* ── Turn signal halos (pre-rendered canvases, initially hidden) ── */
+#if FEATURE_TURN_SIGNAL
     {
         turnCanvasBufLeft = (lv_color_t *)heap_caps_malloc(TURN_CANVAS_SIZE, MALLOC_CAP_SPIRAM);
         turnCanvasBufRight = (lv_color_t *)heap_caps_malloc(TURN_CANVAS_SIZE, MALLOC_CAP_SPIRAM);
@@ -684,9 +693,7 @@ static void createDashboard(void) {
             Serial.println("[TURN] PSRAM alloc failed for halo canvases");
         }
     }
-
-    /* Initialize test sequence timer — disabled */
-    // turnTestStartMs = millis();
+#endif // FEATURE_TURN_SIGNAL
 
     Serial.println("[LVGL] Dashboard UI created");
 }
@@ -757,9 +764,8 @@ static void updateDashboard(void) {
         char buf[6];
         snprintf(buf, sizeof(buf), "%d", (int)(battTemp + 0.5f));
         lv_label_set_text(lblTemp, buf);
-        lv_color_t tc = lvTempColor(battTemp);
-        lv_obj_set_style_text_color(lblTemp, tc, 0);
-        lv_obj_set_style_text_color(lblTempUnit, tc, 0);
+        lv_obj_set_style_text_color(lblTemp, COL_WHITE, 0);
+        lv_obj_set_style_text_color(lblTempUnit, COL_WHITE, 0);
     }
     lv_obj_align(lblTemp, LV_ALIGN_CENTER, 72, -8);
 
@@ -812,7 +818,7 @@ static void updateDashboard(void) {
         char buf[8];
         snprintf(buf, sizeof(buf), "%.0f\xC2\xB0", canData.cabinTemp);
         lv_label_set_text(lblCabinTemp, buf);
-        lv_obj_set_style_text_color(lblCabinTemp, COL_AMBER, 0);
+        lv_obj_set_style_text_color(lblCabinTemp, COL_WHITE, 0);
     } else {
         lv_label_set_text(lblCabinTemp, "--\xC2\xB0");
         lv_obj_set_style_text_color(lblCabinTemp, COL_GREY, 0);
@@ -823,7 +829,7 @@ static void updateDashboard(void) {
         char buf[8];
         snprintf(buf, sizeof(buf), "%.0f\xC2\xB0", canData.outdoorTemp);
         lv_label_set_text(lblOutdoorTemp, buf);
-        lv_obj_set_style_text_color(lblOutdoorTemp, COL_BLUE, 0);
+        lv_obj_set_style_text_color(lblOutdoorTemp, COL_WHITE, 0);
     } else {
         lv_label_set_text(lblOutdoorTemp, "--\xC2\xB0");
         lv_obj_set_style_text_color(lblOutdoorTemp, COL_GREY, 0);
@@ -847,11 +853,27 @@ static void updateDashboard(void) {
     }
 
     /* Turn signal halo blink */
+#if FEATURE_TURN_SIGNAL
     {
-        bool leftOn = canData.leftTurnOn;
-        bool rightOn = canData.rightTurnOn;
+        /* Check if turn mode has expired */
+        bool leftActive = false, rightActive = false;
+        if (turnMode != TURN_OFF && turnArmedMs != 0) {
+            unsigned long elapsed = now - turnArmedMs;
+            unsigned long timeout = (turnMode == TURN_LEFT_3 || turnMode == TURN_RIGHT_3)
+                                    ? TURN_3BLINK_MS : TURN_CONT_MS;
+            if (elapsed >= timeout) {
+                turnMode = TURN_OFF;
+                turnArmedMs = 0;
+            } else {
+                leftActive  = (turnMode == TURN_LEFT_3  || turnMode == TURN_LEFT_CONT);
+                rightActive = (turnMode == TURN_RIGHT_3 || turnMode == TURN_RIGHT_CONT);
+            }
+        }
 
-        if (leftOn) {
+        /* Own 500ms blink cycle */
+        bool blinkPhase = (now / 500) % 2 == 0;
+
+        if (leftActive && blinkPhase) {
             if (!turnLeftVisible) {
                 turnLeftOnMs = now;
                 turnLeftVisible = true;
@@ -863,7 +885,7 @@ static void updateDashboard(void) {
             lv_obj_add_flag(arcTurnLeft, LV_OBJ_FLAG_HIDDEN);
         }
 
-        if (rightOn) {
+        if (rightActive && blinkPhase) {
             if (!turnRightVisible) {
                 turnRightOnMs = now;
                 turnRightVisible = true;
@@ -875,6 +897,7 @@ static void updateDashboard(void) {
             lv_obj_add_flag(arcTurnRight, LV_OBJ_FLAG_HIDDEN);
         }
     }
+#endif // FEATURE_TURN_SIGNAL
 }
 
 /* ======================================================================
@@ -887,6 +910,13 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
 
     lastBridgeMsg = millis();
     bridgeEverSeen = true;
+
+#if FEATURE_TURN_SIGNAL
+    /* Log turn-related CAN IDs for debugging */
+    if (m->can_id == 0x311 || m->can_id == 0x249) {
+        Serial.printf("[ESPNOW] id=0x%03X dlc=%u\n", m->can_id, m->dlc);
+    }
+#endif
 
     switch (m->can_id) {
 
@@ -910,11 +940,10 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
             canData.rangeKm = (uint16_t)(rangeMi * 1.609f + 0.5f);
             uint8_t uiSoc = (m->data[6]) & 0x7F;
             uint8_t uiSoe = (m->data[7]) & 0x7F;
-            Serial.printf("[CAN] 0x33A bytes: %02X %02X %02X %02X %02X %02X %02X %02X  UI_SOC=%u UI_uSOE=%u\n",
-                m->data[0], m->data[1], m->data[2], m->data[3],
-                m->data[4], m->data[5], m->data[6], m->data[7], uiSoc, uiSoe);
-            /* Use UI_SOC if valid (1-100), otherwise fall through to SOCUI292 */
-            if (uiSoc >= 1 && uiSoc <= 100) canData.soc = uiSoc;
+            Serial.printf("[CAN] 0x33A rangeMi=%u rangeKm=%u SOC=%u SOE=%u\n",
+                rangeMi, canData.rangeKm, uiSoc, uiSoe);
+            /* Use UI_uSOE (State of Energy) — matches the displayed % on the car */
+            if (uiSoe >= 1 && uiSoe <= 100) canData.soc = uiSoe;
         }
         break;
 
@@ -927,8 +956,8 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
             float displayedSoc = (socFloat - 5.0f) / 95.0f * 100.0f;
             if (displayedSoc < 0.0f) displayedSoc = 0.0f;
             if (displayedSoc > 100.0f) displayedSoc = 100.0f;
-            /* Only use SOCUI292 as fallback if UI_SOC hasn't been set */
-            if (canData.soc == 0) canData.soc = (uint8_t)(displayedSoc + 0.5f);
+            /* BMS SOC fallback — always update so we have a value even if 0x33A is delayed */
+            canData.soc = (uint8_t)(displayedSoc + 0.5f);
         }
         break;
 
@@ -1011,21 +1040,54 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
     case CAN_ID_HEARTBEAT:
         break;
 
-    case CAN_ID_LEFT_LIGHT:
-        if (m->dlc >= 1) {
-            /* VCLEFT_turnSignalStatus: bit 4, 2 bits — 1=ON */
-            uint8_t status = (m->data[0] >> 4) & 0x03;
-            canData.leftTurnOn = (status == 1);
+#if FEATURE_TURN_SIGNAL
+    case CAN_ID_UI_WARNING:
+        if (m->dlc >= 4) {
+            uint8_t leftBlink  = m->data[3] & 0x03;
+            uint8_t rightBlink = (m->data[3] >> 2) & 0x03;
+            unsigned long now = millis();
+            if (leftBlink != 0 && turnMode == TURN_OFF) {
+                turnMode = TURN_LEFT_CONT; turnArmedMs = now;
+            } else if (leftBlink == 0 && (turnMode == TURN_LEFT_3 || turnMode == TURN_LEFT_CONT)) {
+                turnMode = TURN_OFF; turnArmedMs = 0;
+            }
+            if (rightBlink != 0 && turnMode == TURN_OFF) {
+                turnMode = TURN_RIGHT_CONT; turnArmedMs = now;
+            } else if (rightBlink == 0 && (turnMode == TURN_RIGHT_3 || turnMode == TURN_RIGHT_CONT)) {
+                turnMode = TURN_OFF; turnArmedMs = 0;
+            }
+            Serial.printf("[311] d3=%02X L=%u R=%u mode=%d t=%lu\n",
+                          m->data[3], leftBlink, rightBlink, turnMode, now);
         }
         break;
 
-    case CAN_ID_RIGHT_LIGHT:
-        if (m->dlc >= 1) {
-            /* VCRIGHT_turnSignalStatus: bit 4, 2 bits — 1=ON */
-            uint8_t status = (m->data[0] >> 4) & 0x03;
-            canData.rightTurnOn = (status == 1);
+    case CAN_ID_STALK:
+        if (m->dlc >= 3) {
+            uint8_t stalk = m->data[2] & 0x07;
+            unsigned long now = millis();
+            bool leftWas  = (turnMode == TURN_LEFT_3  || turnMode == TURN_LEFT_CONT);
+            bool rightWas = (turnMode == TURN_RIGHT_3 || turnMode == TURN_RIGHT_CONT);
+
+            if (stalk == 1 || stalk == 2) {
+                if (leftWas) {
+                    turnMode = TURN_OFF; turnArmedMs = 0;
+                } else {
+                    turnMode = (stalk == 1) ? TURN_LEFT_3 : TURN_LEFT_CONT;
+                    turnArmedMs = now;
+                }
+            } else if (stalk == 3 || stalk == 4) {
+                if (rightWas) {
+                    turnMode = TURN_OFF; turnArmedMs = 0;
+                } else {
+                    turnMode = (stalk == 3) ? TURN_RIGHT_3 : TURN_RIGHT_CONT;
+                    turnArmedMs = now;
+                }
+            }
+            if (stalk != 0)
+                Serial.printf("[249] stalk=%u mode=%d t=%lu\n", stalk, turnMode, now);
         }
         break;
+#endif // FEATURE_TURN_SIGNAL
     }
 }
 
@@ -1071,6 +1133,7 @@ void startWiFi() {
     WiFi.config(STATIC_IP, GATEWAY, SUBNET);
     WiFi.begin(AP_SSID);
     WiFi.setSleep(false);
+    WiFi.setAutoReconnect(false);  // Prevent background channel scanning
     esp_wifi_set_max_tx_power(78);  // Max TX power (19.5 dBm) for EMI resilience
     Serial.printf("[WIFI] Connecting to %s (non-blocking)\n", AP_SSID);
 }
@@ -1335,6 +1398,19 @@ static unsigned long dispT0 = 0;
 void loop() {
     unsigned long now = millis();
 
+    /* Debug heartbeat every 5 s */
+    static unsigned long lastHB = 0;
+    if (now - lastHB >= 5000) {
+        lastHB = now;
+#if FEATURE_TURN_SIGNAL
+        Serial.printf("[HB] %lums stream=%d bridgeSeen=%d mode=%d armed=%lu\n",
+                      now, streamActive, (int)bridgeEverSeen, turnMode, turnArmedMs);
+#else
+        Serial.printf("[HB] %lums stream=%d bridgeSeen=%d soc=%d range=%d\n",
+                      now, streamActive, (int)bridgeEverSeen, canData.soc, canData.rangeKm);
+#endif
+    }
+
     /* ── WiFi connection management ── */
     if (!wifiConnected && WiFi.status() == WL_CONNECTED) {
         wifiConnected = true;
@@ -1343,6 +1419,15 @@ void loop() {
     } else if (wifiConnected && WiFi.status() != WL_CONNECTED) {
         wifiConnected = false;
         Serial.println("[WIFI] Disconnected");
+    }
+
+    /* ── Manual WiFi reconnect (avoid constant channel scanning) ── */
+    static unsigned long lastWifiRetry = 0;
+    if (!wifiConnected && (now - lastWifiRetry >= 15000)) {
+        lastWifiRetry = now;
+        WiFi.begin(AP_SSID);
+        /* Re-pin ESP-NOW channel after WiFi scan */
+        esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
     }
 
     /* ── Touch toggle ── */

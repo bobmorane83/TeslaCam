@@ -73,6 +73,11 @@
 #define HEARTBEAT_CAN_ID  0xFFF    // Special ID for bridge heartbeat
 
 // ───────────────────────────────────────────────────────────────────────────
+// ESP-NOW RATE LIMITING — prevent frequent CAN IDs from saturating channel
+// ───────────────────────────────────────────────────────────────────────────
+#define ESPNOW_MIN_INTERVAL_MS 200  // Max 5 msg/s per CAN ID via ESP-NOW
+
+// ───────────────────────────────────────────────────────────────────────────
 // UDP BATCHING — critical for WiFi stability
 // Instead of 1 UDP packet per CAN frame (1000+/s = WiFi death),
 // we buffer frames and flush every UDP_FLUSH_INTERVAL_MS.
@@ -128,6 +133,15 @@ LED_State_t led_state = {false, 0, false};
 volatile bool can_message_ready = false;
 unsigned long last_can_check = 0;
 unsigned long last_stats_print = 0;
+
+// ESP-NOW per-ID rate limiting (2048 × 4 bytes = 8 KB)
+static unsigned long espnow_last_sent[2048] = {0};
+
+// ───────────────────────────────────────────────────────────────────────────
+// TURN SIGNAL PRIORITY IDs
+// ───────────────────────────────────────────────────────────────────────────
+#define TURN_CAN_ID_UI     0x311 // UI_warning: leftBlinkerBlinking / rightBlinkerBlinking
+#define TURN_CAN_ID_3F5    0x3F5 // VCFRONT_lighting (fallback)
 unsigned long stats_messages_rx = 0;
 unsigned long stats_espnow_tx = 0;
 unsigned long stats_udp_tx = 0;
@@ -386,8 +400,16 @@ void handleCANMessage(uint32_t id, uint8_t dlc, uint8_t* data) {
     memcpy(msg.data, data, dlc);
     if (dlc < 8) memset(msg.data + dlc, 0, 8 - dlc);
 
-    // Dual path: ESP_NOW (if enabled) + buffer for batched UDP
-    transmitViaESPNOW(&msg);
+    // ESP-NOW rate limiting: max 1 per ESPNOW_MIN_INTERVAL_MS per CAN ID
+    // Priority IDs bypass rate limiting entirely
+    uint16_t idx = id & 0x7FF;
+    bool priority = (id == 0x257 || id == 0x266 || id == 0x2E5 || id == 0x33A ||
+                     id == TURN_CAN_ID_UI || id == TURN_CAN_ID_3F5 || id == 0x249);
+    if (priority || msg.timestamp - espnow_last_sent[idx] >= ESPNOW_MIN_INTERVAL_MS) {
+        espnow_last_sent[idx] = msg.timestamp;
+        transmitViaESPNOW(&msg);
+    }
+
     bufferForUDP(&msg);
 }
 
