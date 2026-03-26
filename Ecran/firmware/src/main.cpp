@@ -34,11 +34,12 @@ LV_FONT_DECLARE(font_montserrat_72);
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
     10, 9, 11, 12, 13, 14);
 
-Arduino_GFX *gfx = new Arduino_ST77916(
+Arduino_ST77916 *tft = new Arduino_ST77916(
     bus, TFT_RST, 0, true,
     SCREEN_W, SCREEN_H, 0, 0, 0, 0,
     st77916_150_init_operations,
     sizeof(st77916_150_init_operations));
+Arduino_GFX *gfx = tft;  /* alias for LVGL and general GFX calls */
 
 /* ======================================================================
  *  WiFi / BLE / TOUCH
@@ -85,9 +86,8 @@ static uint32_t chunkBitmap = 0;  // bit i = 1 if chunk i received (up to 32 chu
 #define FRAME_ASSEMBLY_TIMEOUT_MS 200
 
 /* ======================================================================
- *  SCREEN BUFFERS (for camera JPEG mode)
+ *  CAMERA STATE
  * ====================================================================== */
-static uint16_t *screenBuf;   // 360x360 for JPEG decode
 static volatile unsigned long lastFrameTime = 0;
 #define FRAME_TIMEOUT_MS 2000
 static bool screenBlank = true;
@@ -1330,10 +1330,17 @@ static int jpegDrawCallback(JPEGDRAW *pDraw) {
     int sx = ix1 - cropX + screenOX, sy = iy1 - cropY + screenOY;
     int w = ix2 - ix1, h = iy2 - iy1;
     int offX = ix1 - pDraw->x, offY = iy1 - pDraw->y;
-    for (int row = 0; row < h; row++) {
-        uint16_t *src = pDraw->pPixels + (offY + row) * pDraw->iWidth + offX;
-        uint16_t *dst = screenBuf + (sy + row) * SCREEN_W + sx;
-        memcpy(dst, src, w * 2);
+    /* Push MCU block directly to display (SPI transaction already open) */
+    tft->writeAddrWindow(sx, sy, w, h);
+    if (offX == 0 && w == pDraw->iWidth) {
+        /* Full-width block — single bulk push */
+        tft->writePixels(pDraw->pPixels + offY * pDraw->iWidth, w * h);
+    } else {
+        /* Partial block — push row by row */
+        for (int row = 0; row < h; row++) {
+            uint16_t *src = pDraw->pPixels + (offY + row) * pDraw->iWidth + offX;
+            tft->writePixels(src, w);
+        }
     }
     return 1;
 }
@@ -1359,7 +1366,9 @@ void decodeAndDisplay(int bufIdx, size_t len) {
     screenOY = (imgH >= SCREEN_H) ? 0 : (SCREEN_H - imgH) / 2;
     drawH = (imgH >= SCREEN_H) ? SCREEN_H : imgH;
     jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+    tft->startWrite();  /* Open SPI transaction for all MCU blocks */
     int decRet = jpeg.decode(0, 0, 0);
+    tft->endWrite();    /* Close SPI transaction */
     jpeg.close();
     releaseDisplayBuffer();
     if (decRet != 1) {
@@ -1370,7 +1379,6 @@ void decodeAndDisplay(int bufIdx, size_t len) {
                           decRet, jpeg.getLastError(), len, imgW, imgH);
         return;
     }
-    gfx->draw16bitRGBBitmap(0, 0, screenBuf, SCREEN_W, SCREEN_H);
     screenBlank = false;
     firstFrameReceived = true;
     if (jpegOkCount <= 3)
@@ -1409,12 +1417,7 @@ void setup() {
             while (true) delay(1000);
         }
     }
-    screenBuf = (uint16_t *)heap_caps_malloc(SCREEN_W * SCREEN_H * 2, MALLOC_CAP_SPIRAM);
-    if (!screenBuf) {
-        Serial.println("[FATAL] Screen buffer alloc failed");
-        while (true) delay(1000);
-    }
-    memset(screenBuf, 0, SCREEN_W * SCREEN_H * 2);
+    /* screenBuf removed — MCU blocks pushed directly to display */
     Serial.printf("[MEM] Free PSRAM: %u\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     tbMutex = xSemaphoreCreateMutex();
