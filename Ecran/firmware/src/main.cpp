@@ -1507,6 +1507,8 @@ void loop() {
             lastCtrlSendMs = now;
             lastFrameTime = now;
             firstFrameReceived = false;
+            screenBlank = true;
+            gfx->fillScreen(0x0000);  /* Clear dashboard before camera view */
             Serial.println("[TOUCH] Camera ON — ESP-NOW paused");
         } else {
             espNowPaused = false;
