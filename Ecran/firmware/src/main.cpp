@@ -1269,7 +1269,7 @@ void processPacket(uint8_t *data, size_t len) {
         return;
     }
 
-    if (chunkSize > CHUNK_PAYLOAD || chunkSize + HEADER_SIZE > len) return;
+    if (chunkSize > CHUNK_PAYLOAD || (size_t)chunkSize + HEADER_SIZE > len) return;
     if (frameId != currentFrameId) {
         /* New frame arrived — discard previous incomplete frame */
         currentFrameId = frameId;
@@ -1298,6 +1298,7 @@ void processPacket(uint8_t *data, size_t len) {
             Serial.printf("[BLE-MISS] fid=%u expected=%u got_bits=0x%08X expected_bits=0x%08X\n",
                           frameId, expectedChunks, chunkBitmap, expectedBits);
         }
+        totalFramesComplete++;
         promoteCurrentFrame();
     }
 }
