@@ -114,7 +114,7 @@ bool initCamera() {
     cfg.pin_sccb_scl = SIOC_GPIO;
     cfg.pin_pwdn     = PWDN_GPIO;
     cfg.pin_reset    = RESET_GPIO;
-    cfg.xclk_freq_hz = 20000000;
+    cfg.xclk_freq_hz = 24000000;
     cfg.pixel_format = PIXFORMAT_JPEG;
     cfg.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
 
