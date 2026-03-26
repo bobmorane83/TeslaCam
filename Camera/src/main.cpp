@@ -1,31 +1,25 @@
 /*
  * TeslaCam — ESP32-S3 Camera (OV5640)
- * SoftAP + UDP raw streaming to ESP32-S3 Display
+ * BLE (NimBLE) JPEG streaming to ESP32-S3 Display
  *
- * Captures JPEG frames at VGA (640×480) and sends them
- * via raw lwip UDP to the broadcast address 192.168.4.255:5000.
+ * Captures JPEG frames at HVGA (480×320) and sends them
+ * via BLE GATT notifications to the connected display.
  */
 
 #include <Arduino.h>
-#include <WiFi.h>
-#include <esp_wifi.h>
+#include <NimBLEDevice.h>
 #include "esp_camera.h"
-#include "lwip/sockets.h"
-#include "lwip/netdb.h"
 
-// ── WiFi SoftAP ─────────────────────────────────────────────────────────────────
-static const char *AP_SSID = "TeslaCam";
-static const IPAddress AP_IP(192, 168, 4, 1);
-static const IPAddress AP_GW(192, 168, 4, 1);
-static const IPAddress AP_MASK(255, 255, 255, 0);
-#define WIFI_CHANNEL 1  // WiFi channel (must match Bridge + Display)
+// ── BLE ─────────────────────────────────────────────────────────────────────────
+#define BLE_DEVICE_NAME  "TeslaCam"
+#define SERVICE_UUID     "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define FRAME_CHAR_UUID  "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define CTRL_CHAR_UUID   "beb5483e-36e1-4688-b7f5-ea07361b26a9"
 
-// ── Receiver ────────────────────────────────────────────────────────────────────
-static const uint16_t  RECEIVER_PORT = 5000;
-
-// ── UDP chunking ────────────────────────────────────────────────────────────────
-#define CHUNK_PAYLOAD 1400          // Conservative: well under MTU
-#define HEADER_SIZE   8
+// ── Protocol ────────────────────────────────────────────────────────────────────
+#define HEADER_SIZE      8
+#define CHUNK_PAYLOAD    240        // Fits in single LL packet (240+8+3+4 < 255)
+#define CTRL_TIMEOUT_MS  5000       // Stop streaming if no heartbeat for 5s
 
 // ── OV5640 pin mapping (ESP32-S3 WROOM / Freenove) ─────────────────────────────
 #define PWDN_GPIO   -1
@@ -45,15 +39,57 @@ static const uint16_t  RECEIVER_PORT = 5000;
 #define HREF_GPIO    7
 #define PCLK_GPIO   13
 
-static int udp_sock = -1;
-static struct sockaddr_in dest_addr;
+// ── BLE state ───────────────────────────────────────────────────────────────────
+static NimBLEServer *pServer = nullptr;
+static NimBLECharacteristic *frameChar = nullptr;
+static NimBLECharacteristic *ctrlChar = nullptr;
+static volatile bool deviceConnected = false;
+static volatile bool streamEnabled = false;
+static volatile unsigned long lastCtrlTime = 0;
+static volatile uint16_t negotiatedMTU = 23;
 static uint16_t frame_id = 0;
 
-// ── Control channel (port 5001) ─────────────────────────────────────────────────
-#define CTRL_PORT 5001
-#define CTRL_TIMEOUT_MS 5000       // Stop streaming if no heartbeat for 5s
-static volatile bool streamEnabled = false;    // Sleep by default, wait for STRT
-static volatile unsigned long lastCtrlTime = 0;
+// ── BLE Callbacks ───────────────────────────────────────────────────────────────
+class ServerCallbacks : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer *s, ble_gap_conn_desc *desc) override {
+        deviceConnected = true;
+        /* Request fast connection params for throughput:
+           min=6 (7.5ms), max=6 (7.5ms), latency=0, timeout=200 (2s) */
+        s->updateConnParams(desc->conn_handle, 6, 6, 0, 200);
+        /* Request 2M PHY for double throughput */
+        ble_gap_set_prefered_le_phy(desc->conn_handle,
+                                    BLE_GAP_LE_PHY_2M_MASK,
+                                    BLE_GAP_LE_PHY_2M_MASK,
+                                    BLE_HCI_LE_PHY_CODED_ANY);
+        Serial.printf("[BLE] Client connected, handle=%u\n", desc->conn_handle);
+    }
+    void onDisconnect(NimBLEServer *s) override {
+        deviceConnected = false;
+        streamEnabled = false;
+        NimBLEDevice::startAdvertising();
+        Serial.println("[BLE] Client disconnected — re-advertising");
+    }
+    void onMTUChange(uint16_t mtu, ble_gap_conn_desc *desc) override {
+        negotiatedMTU = mtu;
+        Serial.printf("[BLE] MTU: %u (payload: %u)\n", mtu, mtu - 3);
+    }
+};
+
+class CtrlCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *pChar) override {
+        std::string val = pChar->getValue();
+        if (val.length() >= 4) {
+            if (memcmp(val.data(), "STRT", 4) == 0) {
+                if (!streamEnabled) Serial.println("[CTRL] START");
+                streamEnabled = true;
+                lastCtrlTime = millis();
+            } else if (memcmp(val.data(), "STOP", 4) == 0) {
+                if (streamEnabled) Serial.println("[CTRL] STOP");
+                streamEnabled = false;
+            }
+        }
+    }
+};
 
 // ─────────────────────────────────────────────────────────────────────────────────
 //  Camera init
@@ -80,14 +116,14 @@ bool initCamera() {
     cfg.pin_reset    = RESET_GPIO;
     cfg.xclk_freq_hz = 20000000;
     cfg.pixel_format = PIXFORMAT_JPEG;
-    cfg.grab_mode    = CAMERA_GRAB_LATEST;
+    cfg.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
 
     if (psramFound()) {
-        cfg.frame_size   = FRAMESIZE_HVGA;   // 480×320 – smaller JPEG, lower latency
-        cfg.jpeg_quality = 18;               // Lower quality = smaller JPEG = fewer UDP chunks
-        cfg.fb_count     = 2;
+        cfg.frame_size   = FRAMESIZE_QVGA;   // 320×240 – smaller for BLE throughput
+        cfg.jpeg_quality = 12;                 // Standard quality
+        cfg.fb_count     = 1;
         cfg.fb_location  = CAMERA_FB_IN_PSRAM;
-        Serial.println("[CAM] PSRAM \u2013 HVGA, 2 buffers");
+        Serial.println("[CAM] PSRAM – QVGA, 1 buffer");
     } else {
         cfg.frame_size   = FRAMESIZE_QVGA;
         cfg.jpeg_quality = 12;
@@ -106,92 +142,78 @@ bool initCamera() {
     if (s) {
         Serial.printf("[CAM] Sensor PID: 0x%04X\n", s->id.PID);
         s->set_vflip(s, 1);     // Flip vertical (caméra de recul)
-        s->set_hmirror(s, 0);   // Pas de miroir horizontal
+        s->set_hmirror(s, 0);
     }
     Serial.println("[CAM] Camera ready");
     return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────
-//  WiFi SoftAP
+//  BLE Server init
 // ─────────────────────────────────────────────────────────────────────────────────
-void startSoftAP() {
-    WiFi.mode(WIFI_AP);
-    WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
-    WiFi.softAP(AP_SSID, nullptr, WIFI_CHANNEL);  // Must match Bridge + Display
-    Serial.printf("[WIFI] SoftAP started – SSID: %s  IP: %s\n",
-                  AP_SSID, WiFi.softAPIP().toString().c_str());
+void initBLE() {
+    NimBLEDevice::init(BLE_DEVICE_NAME);
+    NimBLEDevice::setMTU(517);
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);  // Max TX power
+
+    pServer = NimBLEDevice::createServer();
+    pServer->setCallbacks(new ServerCallbacks());
+
+    NimBLEService *pService = pServer->createService(SERVICE_UUID);
+
+    /* Frame data characteristic — Notify, camera pushes JPEG chunks */
+    frameChar = pService->createCharacteristic(
+        FRAME_CHAR_UUID,
+        NIMBLE_PROPERTY::NOTIFY
+    );
+
+    /* Control characteristic — Write, display sends STRT/STOP */
+    ctrlChar = pService->createCharacteristic(
+        CTRL_CHAR_UUID,
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
+    );
+    ctrlChar->setCallbacks(new CtrlCallbacks());
+
+    pService->start();
+
+    NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
+    pAdv->addServiceUUID(SERVICE_UUID);
+    pAdv->setScanResponse(true);
+    pAdv->start();
+
+    Serial.printf("[BLE] Server started — advertising as \"%s\"\n", BLE_DEVICE_NAME);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────
-//  Init raw lwip UDP socket
-// ─────────────────────────────────────────────────────────────────────────────────
-void initUDP() {
-    udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (udp_sock < 0) {
-        Serial.println("[UDP] Socket creation failed");
-        return;
-    }
-
-    // Enable broadcast
-    int broadcast = 1;
-    setsockopt(udp_sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
-
-    // Increase send buffer
-    int sndbuf = 32768;
-    setsockopt(udp_sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-
-    // Set destination: broadcast on subnet
-    memset(&dest_addr, 0, sizeof(dest_addr));
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(RECEIVER_PORT);
-    dest_addr.sin_addr.s_addr = inet_addr("192.168.4.2");
-
-    Serial.printf("[UDP] Socket ready, target 192.168.4.2:%d\n", RECEIVER_PORT);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────────
-//  Send one JPEG frame via UDP chunks
+//  Send one JPEG frame via BLE notifications
 // ─────────────────────────────────────────────────────────────────────────────────
 void sendFrame(camera_fb_t *fb) {
-    if (udp_sock < 0) return;
+    if (!deviceConnected || negotiatedMTU < CHUNK_PAYLOAD + HEADER_SIZE + 3) return;
 
     uint16_t total_chunks = (fb->len + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
     uint8_t packet[HEADER_SIZE + CHUNK_PAYLOAD];
-    int errors = 0;
 
     for (uint16_t i = 0; i < total_chunks; i++) {
+        if (!deviceConnected) return;  // Bail if disconnected mid-frame
+
         uint32_t offset = (uint32_t)i * CHUNK_PAYLOAD;
-        uint16_t size = (uint16_t)min((size_t)CHUNK_PAYLOAD, (size_t)(fb->len - offset));
+        uint16_t size = (uint16_t)min((size_t)CHUNK_PAYLOAD, fb->len - (size_t)offset);
 
         // Header: frame_id(2) + chunk_id(2) + total_chunks(2) + chunk_size(2)
         memcpy(packet + 0, &frame_id,      2);
         memcpy(packet + 2, &i,             2);
         memcpy(packet + 4, &total_chunks,  2);
         memcpy(packet + 6, &size,          2);
-        // Payload
         memcpy(packet + HEADER_SIZE, fb->buf + offset, size);
 
-        int ret = sendto(udp_sock, packet, HEADER_SIZE + size, 0,
-                         (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-        if (ret < 0) {
-            errors++;
-            if (errors == 1) {
-                Serial.printf("[UDP] sendto err: errno=%d, heap=%u\n",
-                              errno, ESP.getFreeHeap());
-            }
-            continue;
-        }
+        frameChar->setValue(packet, HEADER_SIZE + size);
+        frameChar->notify();
 
-        // Pace chunks: brief yield every 3 chunks to let WiFi TX drain
-        if (i % 3 == 2) vTaskDelay(pdMS_TO_TICKS(1));
+        // Pacing between notifications — 5ms balances throughput vs reliability
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
-    // Debug: log first 3 frames and any with errors
-    if (frame_id < 3 || errors > 0) {
-        Serial.printf("[UDP] Frame %u: %u chunks, %u bytes, %d errors\n",
-                      frame_id, total_chunks, fb->len, errors);
-    }
-    /* Send END-of-frame marker: frameId + chunkId=0xFFFF + totalChunks + size=0 */
+
+    // End-of-frame marker: chunkId = 0xFFFF
     {
         uint16_t endMarker = 0xFFFF;
         uint16_t zero = 0;
@@ -199,15 +221,21 @@ void sendFrame(camera_fb_t *fb) {
         memcpy(packet + 2, &endMarker,     2);
         memcpy(packet + 4, &total_chunks,  2);
         memcpy(packet + 6, &zero,          2);
-        sendto(udp_sock, packet, HEADER_SIZE, 0,
-               (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        frameChar->setValue(packet, HEADER_SIZE);
+        frameChar->notify();
     }
 
+    if (frame_id < 5 || frame_id % 60 == 0) {
+        uint32_t cksum = 0;
+        for (size_t i = 0; i < fb->len; i++) cksum ^= ((uint32_t)fb->buf[i]) << ((i & 3) * 8);
+        Serial.printf("[TX] fid=%u chunks=%u len=%u cksum=%08X MTU=%u\n",
+                      frame_id, total_chunks, fb->len, cksum, negotiatedMTU);
+    }
     frame_id++;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────
-//  Sensor sleep / wake  (OV5640 software standby via register 0x3008 bit 6)
+//  Sensor sleep / wake (OV5640 software standby via register 0x3008 bit 6)
 // ─────────────────────────────────────────────────────────────────────────────────
 static void setSensorSleep(bool sleep) {
     sensor_t *s = esp_camera_sensor_get();
@@ -217,75 +245,34 @@ static void setSensorSleep(bool sleep) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────
-//  Streaming task — handles both control commands and frame streaming (core 1)
-//  Core 0 is kept entirely free for WiFi driver processing.
+//  Streaming task — core 1 (core 0 free for NimBLE host)
 // ─────────────────────────────────────────────────────────────────────────────────
 void streamTask(void *pvParameters) {
-    // Create and bind control socket (non-blocking)
-    int ctrl_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (ctrl_sock < 0) {
-        Serial.println("[CTRL] Socket creation failed");
-    } else {
-        struct sockaddr_in bind_addr;
-        memset(&bind_addr, 0, sizeof(bind_addr));
-        bind_addr.sin_family = AF_INET;
-        bind_addr.sin_port = htons(CTRL_PORT);
-        bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-        if (bind(ctrl_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-            Serial.println("[CTRL] Bind failed");
-            close(ctrl_sock);
-            ctrl_sock = -1;
-        }
-    }
-    Serial.printf("[CTRL] Listening on port %d (non-blocking)\n", CTRL_PORT);
+    Serial.println("[STREAM] Waiting for BLE client...");
+    while (!deviceConnected) vTaskDelay(pdMS_TO_TICKS(200));
 
-    // Wait for first station to connect, then do one-time ARP warm-up
-    Serial.println("[STREAM] Waiting for station...");
-    while (WiFi.softAPgetStationNum() == 0) {
-        // Still poll ctrl while waiting
-        if (ctrl_sock >= 0) {
-            char cbuf[8];
-            recvfrom(ctrl_sock, cbuf, sizeof(cbuf), MSG_DONTWAIT, NULL, NULL);
-        }
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-    Serial.println("[STREAM] Station connected — ARP warm-up (2s)");
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    Serial.println("[STREAM] Ready — waiting for STRT command");
-    lastCtrlTime = millis();  // prevent immediate heartbeat timeout
-    setSensorSleep(true);     // sensor off by default until STRT
+    Serial.println("[STREAM] Client connected — waiting for STRT");
+    setSensorSleep(true);
+    lastCtrlTime = millis();
 
     unsigned long frames = 0;
     unsigned long t0 = millis();
     bool wasStreaming = false;
 
     while (true) {
-        // Poll control commands (non-blocking)
-        if (ctrl_sock >= 0) {
-            char cbuf[8];
-            int clen = recvfrom(ctrl_sock, cbuf, sizeof(cbuf) - 1,
-                                MSG_DONTWAIT, NULL, NULL);
-            if (clen >= 4) {
-                cbuf[clen] = '\0';
-                if (memcmp(cbuf, "STRT", 4) == 0) {
-                    // Only enable if a station is connected (prevents stale STRT)
-                    if (WiFi.softAPgetStationNum() > 0) {
-                        if (!streamEnabled) {
-                            Serial.println("[CTRL] START received — streaming enabled");
-                        }
-                        streamEnabled = true;
-                        lastCtrlTime = millis();
-                    }
-                } else if (memcmp(cbuf, "STOP", 4) == 0) {
-                    if (streamEnabled) {
-                        Serial.println("[CTRL] STOP received — streaming disabled");
-                    }
-                    streamEnabled = false;
-                }
+        /* Handle disconnect — wait for reconnection */
+        if (!deviceConnected) {
+            if (wasStreaming) {
+                Serial.println("[STREAM] BLE disconnected — pausing");
+                wasStreaming = false;
+                setSensorSleep(true);
+                neopixelWrite(48, 0, 0, 0);
             }
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
         }
 
-        // Wait for stream to be enabled
+        /* Wait for stream to be enabled via STRT command */
         if (!streamEnabled) {
             if (wasStreaming) {
                 Serial.println("[STREAM] Paused — STOP received");
@@ -297,7 +284,7 @@ void streamTask(void *pvParameters) {
             continue;
         }
 
-        // Heartbeat timeout check during streaming
+        /* Heartbeat timeout check */
         if (millis() - lastCtrlTime > CTRL_TIMEOUT_MS) {
             streamEnabled = false;
             neopixelWrite(48, 0, 0, 0);
@@ -305,23 +292,12 @@ void streamTask(void *pvParameters) {
             continue;
         }
 
+        /* Start streaming */
         if (!wasStreaming) {
-            // Don't start sending until station is truly connected
-            if (WiFi.softAPgetStationNum() == 0) {
-                vTaskDelay(pdMS_TO_TICKS(200));
-                continue;
-            }
-            // Wake sensor and let it stabilise before capturing
             setSensorSleep(false);
             neopixelWrite(48, 0, 20, 0);  // Dim green
             vTaskDelay(pdMS_TO_TICKS(200));
-            // Drain stale ctrl commands
-            if (ctrl_sock >= 0) {
-                char drain[8];
-                while (recvfrom(ctrl_sock, drain, sizeof(drain), MSG_DONTWAIT, NULL, NULL) > 0) {}
-            }
-            Serial.printf("[STREAM] Streaming started (stations=%d)\n",
-                          WiFi.softAPgetStationNum());
+            Serial.println("[STREAM] Streaming started (BLE)");
             wasStreaming = true;
             frames = 0;
             t0 = millis();
@@ -333,6 +309,8 @@ void streamTask(void *pvParameters) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
+        /* No cache invalidation — ESP32-S3 GDMA writes PSRAM through cache,
+           so the cache already has fresh data after fb_get() returns. */
 
         sendFrame(fb);
         esp_camera_fb_return(fb);
@@ -340,10 +318,11 @@ void streamTask(void *pvParameters) {
         frames++;
         if (frames % 60 == 0) {
             float fps = frames * 1000.0f / (millis() - t0);
-            Serial.printf("[STREAM] %lu frames, %.1f fps, stations=%d\n",
-                          frames, fps, WiFi.softAPgetStationNum());
+            Serial.printf("[STREAM] %lu frames, %.1f fps\n", frames, fps);
         }
-        taskYIELD();   // minimal yield, no vTaskDelay
+
+        // Brief yield between frames for BLE stack
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
@@ -353,10 +332,10 @@ void streamTask(void *pvParameters) {
 void setup() {
     Serial.begin(115200);
     delay(1000);
-    Serial.println("\n=== TeslaCam – Camera (SoftAP + UDP) ===");
+    Serial.println("\n=== TeslaCam – Camera (BLE NimBLE) ===");
 
     pinMode(48, OUTPUT);
-    neopixelWrite(48, 0, 0, 0);  // RGB LED off
+    neopixelWrite(48, 0, 0, 0);
     pinMode(2, OUTPUT);
     digitalWrite(2, LOW);
 
@@ -365,14 +344,11 @@ void setup() {
         while (true) delay(1000);
     }
 
-    startSoftAP();
-    WiFi.setSleep(false);  // Disable WiFi power saving for max throughput
-    esp_wifi_set_max_tx_power(78);  // Max TX power (19.5 dBm) for EMI resilience
-    initUDP();
+    initBLE();
 
-    // Launch streaming + control task on core 1 (core 0 free for WiFi driver)
+    // Launch streaming task on core 1 (core 0 for NimBLE host)
     xTaskCreatePinnedToCore(streamTask, "stream", 8192, NULL, 1, NULL, 1);
-    Serial.println("[STREAM] Task started on core 1 (waiting for STRT command)");
+    Serial.println("[STREAM] Task started on core 1");
 }
 
 void loop() {

@@ -4,17 +4,16 @@
  * Camera stream via direct JPEG decode (bypasses LVGL).
  *
  * Architecture:
- *   Core 0: UDP recv task (high priority, blocking recv)
+ *   Core 0: BLE notification recv + ESP-NOW recv
  *   Core 1: Main loop -- LVGL timer handler, touch, dashboard / camera
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <NimBLEDevice.h>
 #include <Arduino_GFX_Library.h>
 #include <JPEGDEC.h>
 #include <lvgl.h>
-#include "lwip/sockets.h"
-#include "lwip/netdb.h"
 #include <freertos/semphr.h>
 #include <Wire.h>
 #include <esp_now.h>
@@ -42,24 +41,18 @@ Arduino_GFX *gfx = new Arduino_ST77916(
     sizeof(st77916_150_init_operations));
 
 /* ======================================================================
- *  WiFi / UDP / TOUCH
+ *  WiFi / BLE / TOUCH
  * ====================================================================== */
-static const char *AP_SSID = "TeslaCam";
-static const IPAddress STATIC_IP(192, 168, 4, 2);
-static const IPAddress GATEWAY(192, 168, 4, 1);
-static const IPAddress SUBNET(255, 255, 255, 0);
-#define WIFI_CHANNEL 1  // WiFi channel (must match Camera + Bridge)
+static const char *BLE_SERVER_NAME = "TeslaCam";
+#define SERVICE_UUID     "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define FRAME_CHAR_UUID  "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define CTRL_CHAR_UUID   "beb5483e-36e1-4688-b7f5-ea07361b26a9"
+#define WIFI_CHANNEL 1  // WiFi channel (must match Bridge)
 
-#define UDP_PORT       5000
 #define HEADER_SIZE    8
-#define CHUNK_PAYLOAD  1400
 #define MAX_FRAME_SIZE 65000
-static int udp_sock = -1;
 
-#define CTRL_PORT      5001
 #define CTRL_RESEND_MS 2000
-static int ctrl_sock = -1;
-static struct sockaddr_in ctrl_dest;
 
 #define TOUCH_SDA  7
 #define TOUCH_SCL  8
@@ -70,8 +63,13 @@ static bool touchedPrev       = false;
 static unsigned long lastToggleMs = 0;
 static bool streamActive      = false;
 static unsigned long lastCtrlSendMs = 0;
-static bool wifiConnected     = false;
+static bool bleConnected      = false;
 static bool networkReady      = false;
+
+/* BLE Client */
+static NimBLEClient *pBleClient = nullptr;
+static NimBLERemoteCharacteristic *remoteFrameChar = nullptr;
+static NimBLERemoteCharacteristic *remoteCtrlChar = nullptr;
 
 /* ======================================================================
  *  TRIPLE-BUFFERED JPEG RECEPTION
@@ -83,6 +81,7 @@ static size_t tbReadyLen = 0;
 static uint16_t currentFrameId = 0, expectedChunks = 0, receivedChunks = 0;
 static size_t recvFrameLen = 0;
 static unsigned long frameStartMs = 0;
+static uint32_t chunkBitmap = 0;  // bit i = 1 if chunk i received (up to 32 chunks)
 #define FRAME_ASSEMBLY_TIMEOUT_MS 200
 
 /* ======================================================================
@@ -847,8 +846,8 @@ static void updateDashboard(void) {
             bDotCol = COL_RED;
         lv_obj_set_style_bg_color(dotBridge, bDotCol, 0);
 
-        /* Camera dot: green when WiFi connected, red otherwise */
-        lv_color_t cDotCol = wifiConnected ? COL_GREEN : COL_RED;
+        /* Camera dot: green when BLE connected, red otherwise */
+        lv_color_t cDotCol = bleConnected ? COL_GREEN : COL_RED;
         lv_obj_set_style_bg_color(dotCamera, cDotCol, 0);
     }
 
@@ -1113,58 +1112,124 @@ bool isTouched() {
 }
 
 void sendCtrlCommand(const char *cmd) {
-    if (ctrl_sock < 0) return;
-    sendto(ctrl_sock, cmd, 4, 0,
-           (struct sockaddr *)&ctrl_dest, sizeof(ctrl_dest));
+    if (!bleConnected || !remoteCtrlChar) return;
+    remoteCtrlChar->writeValue((const uint8_t *)cmd, 4, false);
 }
 
 /* ======================================================================
- *  CAMERA STREAM (JPEG)
+ *  CAMERA STREAM (BLE JPEG)
  * ====================================================================== */
-void udpRecvTask(void *pvParameters);
+#define CHUNK_PAYLOAD  240  // Must match Camera
+
+/* Forward declarations for frame processing */
+void processPacket(uint8_t *data, size_t len);
 
 void startWiFi() {
     WiFi.mode(WIFI_STA);
-
-    /* Initialize ESP-NOW early on configured channel */
-    esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
-    initESPNOW();
-
-    WiFi.config(STATIC_IP, GATEWAY, SUBNET);
-    WiFi.begin(AP_SSID);
+    WiFi.disconnect();
     WiFi.setSleep(false);
-    WiFi.setAutoReconnect(false);  // Prevent background channel scanning
-    esp_wifi_set_max_tx_power(78);  // Max TX power (19.5 dBm) for EMI resilience
-    Serial.printf("[WIFI] Connecting to %s (non-blocking)\n", AP_SSID);
+    esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_max_tx_power(78);
+    initESPNOW();
+    Serial.println("[WIFI] STA mode for ESP-NOW only");
 }
 
-void setupNetwork() {
-    if (networkReady) return;
+static uint32_t bleNotifyCount = 0;
+/* BLE notification callback — feeds into existing processPacket pipeline */
+static void bleNotifyCB(NimBLERemoteCharacteristic *pChar, uint8_t *data,
+                        size_t length, bool isNotify) {
+    bleNotifyCount++;
+    processPacket(data, length);
+}
 
-    udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (udp_sock >= 0) {
-        struct sockaddr_in bind_addr = {};
-        bind_addr.sin_family = AF_INET;
-        bind_addr.sin_port = htons(UDP_PORT);
-        bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-        bind(udp_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr));
-        int rcvbuf = 65536;
-        setsockopt(udp_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+/* BLE Client Callbacks */
+class EcranClientCallbacks : public NimBLEClientCallbacks {
+    void onConnect(NimBLEClient *pClient) override {
+        bleConnected = true;
+        Serial.printf("[BLE] Connected to Camera, MTU=%u\n", pClient->getMTU());
     }
+    void onDisconnect(NimBLEClient *pClient) override {
+        bleConnected = false;
+        remoteFrameChar = nullptr;
+        remoteCtrlChar = nullptr;
+        Serial.println("[BLE] Disconnected from Camera");
+    }
+};
+static EcranClientCallbacks ecranClientCB;
 
-    ctrl_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    memset(&ctrl_dest, 0, sizeof(ctrl_dest));
-    ctrl_dest.sin_family = AF_INET;
-    ctrl_dest.sin_port = htons(CTRL_PORT);
-    ctrl_dest.sin_addr.s_addr = inet_addr("192.168.4.1");
+/* Scan for Camera and connect — runs as a task */
+void bleConnectTask(void *pvParameters) {
+    NimBLEScan *pScan = NimBLEDevice::getScan();
+    pScan->setActiveScan(true);
+    pScan->setInterval(100);
+    pScan->setWindow(99);
 
-    xTaskCreatePinnedToCore(udpRecvTask, "udpRecv", 4096, NULL, 2, NULL, 0);
-    Serial.println("[NET] Network stack ready");
-    networkReady = true;
+    while (true) {
+        if (!bleConnected) {
+            Serial.println("[BLE] Scanning for TeslaCam...");
+            NimBLEScanResults results = pScan->start(3);  // 3s scan
+
+            NimBLEAdvertisedDevice *camDevice = nullptr;
+            for (int i = 0; i < results.getCount(); i++) {
+                NimBLEAdvertisedDevice dev = results.getDevice(i);
+                if (dev.getName() == BLE_SERVER_NAME) {
+                    camDevice = new NimBLEAdvertisedDevice(dev);
+                    break;
+                }
+            }
+
+            if (camDevice) {
+                Serial.println("[BLE] Found TeslaCam — connecting...");
+                if (pBleClient) {
+                    NimBLEDevice::deleteClient(pBleClient);
+                    pBleClient = nullptr;
+                }
+                pBleClient = NimBLEDevice::createClient();
+                pBleClient->setClientCallbacks(&ecranClientCB, false);
+
+                if (pBleClient->connect(camDevice)) {
+                    /* Request 2M PHY for double throughput */
+                    ble_gap_set_prefered_le_phy(pBleClient->getConnId(),
+                                                BLE_GAP_LE_PHY_2M_MASK,
+                                                BLE_GAP_LE_PHY_2M_MASK,
+                                                BLE_HCI_LE_PHY_CODED_ANY);
+                    NimBLERemoteService *pService = pBleClient->getService(SERVICE_UUID);
+                    if (pService) {
+                        remoteFrameChar = pService->getCharacteristic(FRAME_CHAR_UUID);
+                        remoteCtrlChar = pService->getCharacteristic(CTRL_CHAR_UUID);
+
+                        if (remoteFrameChar && remoteFrameChar->canNotify()) {
+                            remoteFrameChar->subscribe(true, bleNotifyCB);
+                            bleConnected = true;
+                            Serial.println("[BLE] Subscribed to frame notifications");
+                        }
+                    }
+                    if (!bleConnected) {
+                        pBleClient->disconnect();
+                    }
+                } else {
+                    Serial.println("[BLE] Connection failed");
+                }
+                delete camDevice;
+            }
+            /* Re-pin ESP-NOW channel after BLE scan */
+            esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+        }
+        vTaskDelay(pdMS_TO_TICKS(bleConnected ? 2000 : 5000));
+    }
+}
+
+void startBLE() {
+    NimBLEDevice::init("TeslaCam-Ecran");
+    NimBLEDevice::setMTU(517);
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    xTaskCreatePinnedToCore(bleConnectTask, "bleConn", 4096, NULL, 1, NULL, 0);
+    Serial.println("[BLE] Client initialized, scanning task started");
 }
 
 /* Promote current write buffer as a ready frame (complete or partial) */
 static void promoteCurrentFrame() {
+    /* ESP32-S3 has shared DCache between cores — no flush needed */
     xSemaphoreTake(tbMutex, portMAX_DELAY);
     tbReady = tbWrite;
     tbReadyLen = recvFrameLen;
@@ -1175,7 +1240,11 @@ static void promoteCurrentFrame() {
     receivedChunks = 0;
     recvFrameLen   = 0;
     expectedChunks = 0;
+    chunkBitmap    = 0;
 }
+
+static uint32_t totalFramesSeen = 0, totalFramesComplete = 0;
+static uint32_t totalChunksSeen = 0, totalChunksExpected = 0;
 
 void processPacket(uint8_t *data, size_t len) {
     if (len < HEADER_SIZE) return;
@@ -1187,24 +1256,35 @@ void processPacket(uint8_t *data, size_t len) {
 
     /* END-of-frame marker: chunkId == 0xFFFF */
     if (chunkId == 0xFFFF) {
-        if (frameId == currentFrameId && expectedChunks > 0 && receivedChunks > 0) {
+        totalFramesSeen++;
+        totalChunksSeen += receivedChunks;
+        totalChunksExpected += expectedChunks;
+        if (frameId == currentFrameId && expectedChunks > 0 && receivedChunks >= expectedChunks) {
+            totalFramesComplete++;
             promoteCurrentFrame();
+        } else if (totalFramesSeen % 30 == 0) {
+            Serial.printf("[BLE] frames=%lu complete=%lu chunks=%lu/%lu\n",
+                          totalFramesSeen, totalFramesComplete, totalChunksSeen, totalChunksExpected);
         }
         return;
     }
 
     if (chunkSize > CHUNK_PAYLOAD || chunkSize + HEADER_SIZE > len) return;
     if (frameId != currentFrameId) {
-        /* New frame arrived — promote previous partial frame if >50% received */
-        if (expectedChunks > 0 && receivedChunks > expectedChunks / 2) {
-            promoteCurrentFrame();
-        }
+        /* New frame arrived — discard previous incomplete frame */
         currentFrameId = frameId;
         expectedChunks = totalChunks;
         receivedChunks = 0;
         recvFrameLen   = 0;
+        chunkBitmap    = 0;
         frameStartMs   = millis();
     }
+    /* Detect duplicate chunks */
+    if (chunkId < 32 && (chunkBitmap & (1u << chunkId))) {
+        Serial.printf("[BLE-DUP] fid=%u cid=%u DUPLICATE!\n", frameId, chunkId);
+        return;  // Don't count duplicates
+    }
+    if (chunkId < 32) chunkBitmap |= (1u << chunkId);
     uint32_t offset = (uint32_t)chunkId * CHUNK_PAYLOAD;
     if (offset + chunkSize > MAX_FRAME_SIZE) return;
     memcpy(jpegBuf[tbWrite] + offset, data + HEADER_SIZE, chunkSize);
@@ -1212,31 +1292,13 @@ void processPacket(uint8_t *data, size_t len) {
     if (endPos > recvFrameLen) recvFrameLen = endPos;
     receivedChunks++;
     if (expectedChunks > 0 && receivedChunks >= expectedChunks) {
-        promoteCurrentFrame();
-    }
-}
-
-void udpRecvTask(void *pvParameters) {
-    /* Periodic timeout so we can check frame assembly stalls */
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 }; // 100ms
-    setsockopt(udp_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    uint8_t buf[HEADER_SIZE + CHUNK_PAYLOAD];
-    while (true) {
-        int len = recvfrom(udp_sock, buf, sizeof(buf), 0, NULL, NULL);
-        if (len > 0) processPacket(buf, len);
-
-        /* Frame assembly timeout: accept partial or discard stale frame */
-        if (expectedChunks > 0 && receivedChunks > 0 &&
-            (millis() - frameStartMs > FRAME_ASSEMBLY_TIMEOUT_MS)) {
-            if (receivedChunks > expectedChunks / 2) {
-                promoteCurrentFrame();
-            } else {
-                receivedChunks = 0;
-                recvFrameLen   = 0;
-                expectedChunks = 0;
-            }
+        /* Verify all chunks arrived — check bitmap */
+        uint32_t expectedBits = (expectedChunks < 32) ? ((1u << expectedChunks) - 1) : 0xFFFFFFFF;
+        if (chunkBitmap != expectedBits) {
+            Serial.printf("[BLE-MISS] fid=%u expected=%u got_bits=0x%08X expected_bits=0x%08X\n",
+                          frameId, expectedChunks, chunkBitmap, expectedBits);
         }
+        promoteCurrentFrame();
     }
 }
 
@@ -1247,6 +1309,7 @@ int grabReadyFrame(size_t *outLen) {
     tbReady = -1;
     *outLen = tbReadyLen;
     xSemaphoreGive(tbMutex);
+    /* ESP32-S3 has shared DCache between cores — no invalidation needed */
     return tbDisplay;
 }
 
@@ -1275,12 +1338,19 @@ static int jpegDrawCallback(JPEGDRAW *pDraw) {
     return 1;
 }
 
+static uint32_t jpegOkCount = 0, jpegFailCount = 0;
 void decodeAndDisplay(int bufIdx, size_t len) {
     static JPEGDEC jpeg;
-    if (!jpeg.openRAM(jpegBuf[bufIdx], len, jpegDrawCallback)) {
+    uint8_t *decBuf = jpegBuf[bufIdx];
+
+    if (!jpeg.openRAM(decBuf, len, jpegDrawCallback)) {
+        jpegFailCount++;
+        if (jpegFailCount <= 3 || jpegFailCount % 60 == 0)
+            Serial.printf("[JPEG] openRAM FAIL #%lu (len=%u, ok=%lu)\n", jpegFailCount, len, jpegOkCount);
         releaseDisplayBuffer();
         return;
     }
+    jpegOkCount++;
     int imgW = jpeg.getWidth(), imgH = jpeg.getHeight();
     cropX = (imgW >= SCREEN_W) ? (imgW - SCREEN_W) / 2 : 0;
     screenOX = (imgW >= SCREEN_W) ? 0 : (SCREEN_W - imgW) / 2;
@@ -1289,12 +1359,22 @@ void decodeAndDisplay(int bufIdx, size_t len) {
     screenOY = (imgH >= SCREEN_H) ? 0 : (SCREEN_H - imgH) / 2;
     drawH = (imgH >= SCREEN_H) ? SCREEN_H : imgH;
     jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
-    jpeg.decode(0, 0, 0);
+    int decRet = jpeg.decode(0, 0, 0);
     jpeg.close();
     releaseDisplayBuffer();
+    if (decRet != 1) {
+        jpegFailCount++;
+        jpegOkCount--;  // Undo the increment above
+        if (jpegFailCount <= 5 || jpegFailCount % 60 == 0)
+            Serial.printf("[JPEG] decode() returned %d err=%d (len=%u, %dx%d)\n",
+                          decRet, jpeg.getLastError(), len, imgW, imgH);
+        return;
+    }
     gfx->draw16bitRGBBitmap(0, 0, screenBuf, SCREEN_W, SCREEN_H);
     screenBlank = false;
     firstFrameReceived = true;
+    if (jpegOkCount <= 3)
+        Serial.printf("[JPEG] OK #%lu: %dx%d, len=%u\n", jpegOkCount, imgW, imgH, len);
 }
 
 /* Draw status dots overlay on camera view (direct GFX, bypasses LVGL) */
@@ -1309,7 +1389,7 @@ static void drawStatusDotsOverlay() {
     else
         bCol16 = 0xF9A6; // RED
     gfx->fillCircle(CX - 6, SCREEN_H - 6, 2, bCol16);
-    uint16_t cCol16 = (WiFi.status() == WL_CONNECTED) ? 0x07E0 : 0xF9A6;
+    uint16_t cCol16 = bleConnected ? 0x07E0 : 0xF9A6;
     gfx->fillCircle(CX + 6, SCREEN_H - 6, 2, cCol16);
 }
 
@@ -1323,7 +1403,7 @@ void setup() {
 
     /* ── Allocate PSRAM buffers for camera ── */
     for (int i = 0; i < 3; i++) {
-        jpegBuf[i] = (uint8_t *)heap_caps_malloc(MAX_FRAME_SIZE, MALLOC_CAP_SPIRAM);
+        jpegBuf[i] = (uint8_t *)heap_caps_aligned_alloc(32, MAX_FRAME_SIZE, MALLOC_CAP_SPIRAM);
         if (!jpegBuf[i]) {
             Serial.printf("[FATAL] PSRAM alloc jpegBuf[%d]\n", i);
             while (true) delay(1000);
@@ -1380,8 +1460,9 @@ void setup() {
     delay(50);
     Serial.println("[TOUCH] CST816S init");
 
-    /* ── WiFi (non-blocking) ── */
+    /* ── WiFi (ESP-NOW only) + BLE (camera) ── */
     startWiFi();
+    startBLE();
     lastFrameTime = millis();
 
     /* First LVGL render */
@@ -1406,28 +1487,10 @@ void loop() {
         Serial.printf("[HB] %lums stream=%d bridgeSeen=%d mode=%d armed=%lu\n",
                       now, streamActive, (int)bridgeEverSeen, turnMode, turnArmedMs);
 #else
-        Serial.printf("[HB] %lums stream=%d bridgeSeen=%d soc=%d range=%d\n",
-                      now, streamActive, (int)bridgeEverSeen, canData.soc, canData.rangeKm);
+        Serial.printf("[HB] %lums stream=%d bridgeSeen=%d soc=%d range=%d ble=%d jpegOk=%lu fail=%lu\n",
+                      now, streamActive, (int)bridgeEverSeen, canData.soc, canData.rangeKm,
+                      (int)bleConnected, jpegOkCount, jpegFailCount);
 #endif
-    }
-
-    /* ── WiFi connection management ── */
-    if (!wifiConnected && WiFi.status() == WL_CONNECTED) {
-        wifiConnected = true;
-        Serial.printf("[WIFI] Connected - IP: %s\n", WiFi.localIP().toString().c_str());
-        setupNetwork();
-    } else if (wifiConnected && WiFi.status() != WL_CONNECTED) {
-        wifiConnected = false;
-        Serial.println("[WIFI] Disconnected");
-    }
-
-    /* ── Manual WiFi reconnect (avoid constant channel scanning) ── */
-    static unsigned long lastWifiRetry = 0;
-    if (!wifiConnected && (now - lastWifiRetry >= 15000)) {
-        lastWifiRetry = now;
-        WiFi.begin(AP_SSID);
-        /* Re-pin ESP-NOW channel after WiFi scan */
-        esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
     }
 
     /* ── Touch toggle ── */
