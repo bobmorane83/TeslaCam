@@ -5,7 +5,8 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <esp_wifi.h>
-#include "valid_can_ids.h"  // Whitelist of 159 valid Tesla CAN IDs
+#include <driver/twai.h>
+#include "valid_can_ids.h"  // Whitelist: VehicleBus + ChassisBus IDs
 
 // =============================================================================
 // ESP32-S3 CAN-to-WiFi Hub (Tesla Model 3)
@@ -21,6 +22,12 @@
 #define MCP_MOSI_PIN      11     // SPI MOSI
 #define MCP_MISO_PIN      13     // SPI MISO
 #define MCP_RST_PIN       9      // MCP2515 Hardware Reset
+
+// ───────────────────────────────────────────────────────────────────────────
+// TWAI (ESP32-S3 built-in CAN) — ChassisBus
+// ───────────────────────────────────────────────────────────────────────────
+#define TWAI_TX_PIN       7      // CAN TX (T-2CAN onboard transceiver)
+#define TWAI_RX_PIN       6      // CAN RX (T-2CAN onboard transceiver)
 
 // ───────────────────────────────────────────────────────────────────────────
 // CAN CONFIGURATION
@@ -135,12 +142,14 @@ static unsigned long espnow_last_sent[2048] = {0};
 // ───────────────────────────────────────────────────────────────────────────
 #define TURN_CAN_ID_UI     0x311 // UI_warning: leftBlinkerBlinking / rightBlinkerBlinking
 #define TURN_CAN_ID_3F5    0x3F5 // VCFRONT_lighting (fallback)
-unsigned long stats_messages_rx = 0;
+unsigned long stats_mcp_rx = 0;       // MCP2515 (VehicleBus) frames received
+unsigned long stats_twai_rx = 0;      // TWAI (ChassisBus) frames received
 unsigned long stats_espnow_tx = 0;
 unsigned long stats_udp_tx = 0;
 unsigned long stats_udp_packets = 0;  // Actual UDP packets sent (batches)
 unsigned long stats_udp_skip = 0;
 unsigned long stats_errors = 0;
+bool twai_running = false;            // TWAI driver state
 uint16_t udp_sequence = 0;
 uint8_t  ap_clients_count = 0;
 unsigned long last_client_check = 0;
@@ -169,10 +178,12 @@ unsigned long last_heartbeat = 0;     // Last heartbeat send timestamp
 // FORWARD DECLARATIONS
 // ───────────────────────────────────────────────────────────────────────────
 void initializeCAN(void);
+void initializeTWAI(void);
 void initializeWiFiAP(void);
 void initializeESPNOW(void);
 void initializeUDP(void);
 void checkCANBus(void);
+void checkTWAIBus(void);
 void handleCANMessage(uint32_t id, uint8_t dlc, uint8_t* data);
 void transmitViaESPNOW(ESP_CAN_Message_t* msg);
 void sendHeartbeat(void);
@@ -192,9 +203,9 @@ void setup() {
     delay(500);
 
     Serial.println("\n\n========================================");
-    Serial.println("  ESP32-S3 CAN-to-WiFi Hub v4.0");
+    Serial.println("  ESP32-S3 CAN-to-WiFi Hub v4.1");
     Serial.println("  Tesla Model 3 Bridge");
-    Serial.println("  LilyGo T-2CAN (MCP2515)");
+    Serial.println("  LilyGo T-2CAN (MCP2515 + TWAI)");
     Serial.println("========================================");
     Serial.print("Board: ");
     Serial.println(ARDUINO_BOARD);
@@ -202,6 +213,7 @@ void setup() {
 
     // Init subsystems in order
     initializeCAN();
+    initializeTWAI();
     initializeWiFiAP();
     initializeESPNOW();
     espnow_active = true;
@@ -231,6 +243,7 @@ void loop() {
     if (current_time - last_can_check >= CAN_RX_INTERVAL) {
         last_can_check = current_time;
         checkCANBus();
+        checkTWAIBus();
     }
 
     // Send ESP-NOW heartbeat periodically
@@ -346,12 +359,12 @@ void checkCANBus(void) {
 
         // Stats & logging only when AP is active (save CPU in ESP_NOW-only mode)
         if (ap_active) {
-            stats_messages_rx++;
+            stats_mcp_rx++;
 
             // Compact log (only every 100th message at DEBUG_LEVEL 2)
-            if (DEBUG_LEVEL >= 3 || (stats_messages_rx % 100 == 0)) {
-                Serial.printf("[CAN] #%lu ID:0x%03lX DLC:%d\n",
-                    stats_messages_rx, can_id, dlc);
+            if (DEBUG_LEVEL >= 3 || (stats_mcp_rx % 100 == 0)) {
+                Serial.printf("[MCP] #%lu ID:0x%03lX DLC:%d\n",
+                    stats_mcp_rx, can_id, dlc);
             }
         }
 
@@ -361,17 +374,79 @@ void checkCANBus(void) {
     }
 }
 
-// Check if CAN ID is in the whitelist of valid Tesla messages
-bool isValidCanId(uint32_t id) {
-    // Binary search for faster lookup (159 IDs)
-    int left = 0, right = VALID_CAN_IDS_COUNT - 1;
+// =============================================================================
+// TWAI (ESP32-S3 built-in CAN) — ChassisBus listen-only
+// =============================================================================
+
+void initializeTWAI(void) {
+    Serial.println("[TWAI] Initializing (ChassisBus, listen-only)...");
+
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
+        (gpio_num_t)TWAI_TX_PIN, (gpio_num_t)TWAI_RX_PIN, TWAI_MODE_LISTEN_ONLY);
+    g_config.rx_queue_len = 32;  // Deeper RX queue for burst traffic
+
+    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
+    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    esp_err_t err = twai_driver_install(&g_config, &t_config, &f_config);
+    if (err != ESP_OK) {
+        Serial.printf("[TWAI] Driver install FAILED: 0x%X\n", err);
+        return;
+    }
+
+    err = twai_start();
+    if (err != ESP_OK) {
+        Serial.printf("[TWAI] Start FAILED: 0x%X\n", err);
+        twai_driver_uninstall();
+        return;
+    }
+
+    twai_running = true;
+    Serial.printf("[TWAI] Ready (500 kbps, listen-only, TX=%d RX=%d)\n",
+                  TWAI_TX_PIN, TWAI_RX_PIN);
+}
+
+void checkTWAIBus(void) {
+    if (!twai_running) return;
+
+    twai_message_t rx_msg;
+    // Drain all available messages (non-blocking)
+    while (twai_receive(&rx_msg, 0) == ESP_OK) {
+        // Skip RTR and extended frames (Tesla uses standard 11-bit)
+        if (rx_msg.rtr || rx_msg.extd) continue;
+
+        uint8_t dlc = rx_msg.data_length_code;
+        if (dlc > 8) dlc = 8;
+
+        if (ap_active) {
+            stats_twai_rx++;
+            if (DEBUG_LEVEL >= 3 || (stats_twai_rx % 100 == 0)) {
+                Serial.printf("[TWAI] #%lu ID:0x%03lX DLC:%d\n",
+                    stats_twai_rx, (unsigned long)rx_msg.identifier, dlc);
+            }
+        }
+
+        handleCANMessage(rx_msg.identifier, dlc, rx_msg.data);
+    }
+}
+
+// Binary search helper on a sorted uint16_t array
+static bool bsearch16(const uint16_t* arr, uint16_t count, uint16_t id) {
+    int left = 0, right = count - 1;
     while (left <= right) {
         int mid = left + (right - left) / 2;
-        if (VALID_CAN_IDS[mid] == id) return true;
-        if (VALID_CAN_IDS[mid] < id) left = mid + 1;
+        if (arr[mid] == id) return true;
+        if (arr[mid] < id) left = mid + 1;
         else right = mid - 1;
     }
     return false;
+}
+
+// Check if CAN ID is in either VehicleBus or ChassisBus whitelist
+bool isValidCanId(uint32_t id) {
+    uint16_t id16 = (uint16_t)(id & 0x7FF);
+    return bsearch16(VEHICLE_BUS_IDS, VEHICLE_BUS_IDS_COUNT, id16)
+        || bsearch16(CHASSIS_BUS_IDS, CHASSIS_BUS_IDS_COUNT, id16);
 }
 
 void handleCANMessage(uint32_t id, uint8_t dlc, uint8_t* data) {
@@ -689,7 +764,8 @@ void shutdownAPAndStartESPNOW(void) {
 void printStatistics(void) {
     Serial.println("\n--- Stats ---");
     Serial.printf("  Mode:         %s\n", ap_active ? "WiFi AP + UDP" : "ESP_NOW only");
-    Serial.printf("  CAN RX:       %lu\n", stats_messages_rx);
+    Serial.printf("  MCP RX:       %lu (VehicleBus)\n", stats_mcp_rx);
+    Serial.printf("  TWAI RX:      %lu (ChassisBus)\n", stats_twai_rx);
     if (espnow_active) {
         Serial.printf("  ESP_NOW TX:   %lu\n", stats_espnow_tx);
     }
