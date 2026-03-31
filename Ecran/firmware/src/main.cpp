@@ -146,14 +146,18 @@ static volatile struct {
     float    frontPowerKw;
     uint8_t  utcHour;
     uint8_t  utcMinute;
+    uint8_t  utcDay;
+    uint8_t  utcMonth;
+    uint8_t  utcYear;
     bool     timeReceived;
+    bool     soc33aReceived;
     float    outdoorTemp;
     bool     outdoorTempReceived;
     float    cabinTemp;
     bool     cabinTempReceived;
     bool     leftTurnOn;
     bool     rightTurnOn;
-} canData = { 0, GEAR_P, 0, 0, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0, 0, false, 0.0f, false, 0.0f, false, false, false };
+} canData = { 0, GEAR_P, 0, 0, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0, 0, 0, 0, 0, false, false, 0.0f, false, 0.0f, false, false, false };
 
 #define BRIDGE_TIMEOUT_MS 10000
 static volatile unsigned long lastBridgeMsg = 0;
@@ -161,7 +165,7 @@ static volatile bool bridgeEverSeen = false;
 static volatile bool espNowPaused = false;
 
 static float regenKwSmooth = 0;
-#define MAX_REGEN_KW 50.0f
+#define MAX_REGEN_KW 80.0f
 
 /* ======================================================================
  *  LVGL DISPLAY DRIVER
@@ -801,9 +805,38 @@ static void updateDashboard(void) {
         lv_obj_align(lblRegenKw, LV_ALIGN_BOTTOM_MID, 34, -30);
     }
 
-    /* Time (UTC+1 for France CET) */
+    /* Time (UTC+1 CET or UTC+2 CEST for France, EU DST rules) */
     if (canData.timeReceived && !noConnection) {
-        int localHour = (canData.utcHour + 1) % 24;
+        int offset = 1;  // CET by default
+        uint8_t m = canData.utcMonth;
+        uint8_t d = canData.utcDay;
+        uint8_t h = canData.utcHour;
+        if (m > 3 && m < 10) {
+            offset = 2;  // April–September: always CEST
+        } else if (m == 3 && d >= 25) {
+            /* Last Sunday of March: find day-of-week for March 31 */
+            /* Year from CAN is offset (e.g. 26 = 2026) */
+            int y = 2000 + canData.utcYear;
+            /* Zeller-like formula for day-of-week of March 31 (0=Sun) */
+            int y0 = y; int m0 = 3; int d0 = 31;
+            if (m0 < 3) { m0 += 12; y0--; }
+            int dow31 = (d0 + 13*(m0+1)/5 + y0 + y0/4 - y0/100 + y0/400) % 7;
+            /* Convert Zeller (0=Sat,1=Sun,...6=Fri) to (0=Sun,...6=Sat) */
+            dow31 = (dow31 + 6) % 7;
+            int lastSun = 31 - dow31;  // last Sunday of March
+            if (d > lastSun || (d == lastSun && h >= 1)) offset = 2;
+        } else if (m == 10 && d >= 25) {
+            /* Last Sunday of October */
+            int y = 2000 + canData.utcYear;
+            int y0 = y; int m0 = 10; int d0 = 31;
+            if (m0 < 3) { m0 += 12; y0--; }
+            int dow31 = (d0 + 13*(m0+1)/5 + y0 + y0/4 - y0/100 + y0/400) % 7;
+            dow31 = (dow31 + 6) % 7;
+            int lastSun = 31 - dow31;
+            if (d < lastSun || (d == lastSun && h < 1)) offset = 2;
+            /* else: after last Sunday 01:00 UTC → CET (offset=1) */
+        }
+        int localHour = (canData.utcHour + offset) % 24;
         char buf[6];
         snprintf(buf, sizeof(buf), "%02d:%02d", localHour, canData.utcMinute);
         lv_label_set_text(lblTime, buf);
@@ -943,7 +976,10 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
             Serial.printf("[CAN] 0x33A rangeMi=%u rangeKm=%u SOC=%u SOE=%u\n",
                 rangeMi, canData.rangeKm, uiSoc, uiSoe);
             /* Use UI_uSOE (State of Energy) — matches the displayed % on the car */
-            if (uiSoe >= 1 && uiSoe <= 100) canData.soc = uiSoe;
+            if (uiSoe >= 1 && uiSoe <= 100) {
+                canData.soc = uiSoe;
+                canData.soc33aReceived = true;
+            }
         }
         break;
 
@@ -956,8 +992,10 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
             float displayedSoc = (socFloat - 5.0f) / 95.0f * 100.0f;
             if (displayedSoc < 0.0f) displayedSoc = 0.0f;
             if (displayedSoc > 100.0f) displayedSoc = 100.0f;
-            /* BMS SOC fallback — always update so we have a value even if 0x33A is delayed */
-            canData.soc = (uint8_t)(displayedSoc + 0.5f);
+            /* BMS SOC fallback — only use if 0x33A hasn't provided UI_uSOE yet */
+            if (!canData.soc33aReceived) {
+                canData.soc = (uint8_t)(displayedSoc + 0.5f);
+            }
         }
         break;
 
@@ -1031,7 +1069,10 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
 
     case CAN_ID_UTC_TIME:
         if (m->dlc >= 6) {
+            canData.utcYear   = m->data[0];  // UTCyear318: byte 0
+            canData.utcMonth  = m->data[1];  // UTCmonth318: byte 1
             canData.utcHour   = m->data[3];  // UTChour318: byte 3
+            canData.utcDay    = m->data[4];  // UTCday318: byte 4
             canData.utcMinute = m->data[5];  // UTCminutes318: byte 5
             canData.timeReceived = true;
         }
