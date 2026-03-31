@@ -1,8 +1,8 @@
 # ⚠️ Statut du Hub CAN-to-WiFi - Report de Test
 
-**Date:** 22 février 2026  
-**Board:** NodeMCU-ESP32 DEVKITV1  
-**Status:** ✅ Compilation OK | ⚠️ Attente hardware CAN
+**Date:** Mars 2026  
+**Board:** LilyGo T-2CAN v1.0 (ESP32-S3-WROOM-1U)  
+**Status:** ✅ Compilation OK | ✅ Flashé | ✅ ESP-NOW fonctionnel
 
 ---
 
@@ -25,71 +25,53 @@
 
 ### Runtime Initialization
 ```
-❌ MCP2515 NOT DETECTED
+✅ MCP2515 DETECTED (16 MHz crystal, SPI polling)
 Output:
-  [CAN] Initializing MCP2515...
-  Entering Configuration Mode Failure...
-  [ERR] ✗ MCP2515 initialization failed - check hardware!
-  
-LED blink (200ms ON/OFF): Diagnostic mode = attente hardware
+  [CAN] Initializing MCP2515 (T-2CAN)...
+  [INF] MCP2515 initialized @ 500 kbps (16 MHz crystal)
+  [WiFi] AP SSID: bridge
+  [ESP_NOW] Initialized
+  CAN RX: 0, ESP_NOW TX: 5, Free heap: 259 KB
 ```
 
 ---
 
 ## Diagnostic
 
-### Problème Détecté
-Le module MCP2515 (CAN/SPI) n'est pas détecté sur le bus SPI.
+### Problème Résolu
+Le module MCP2515 est intégré sur la carte T-2CAN. Pas de câblage SPI externe nécessaire.
 
-### Causes Possibles (par ordre de probabilité)
-
-1. **❌ MCP2515 non connecté**
-   - Vérifiez que le module est physiquement connecté
-   - Vérifiez les connexions SPI
-
-2. **❌ Connexions SPI incorrectes**
-   - ESP32 GPIO 18 (SCK)  ↔ MCP2515 SCK
-   - ESP32 GPIO 19 (MISO) ↔ MCP2515 MISO
-   - ESP32 GPIO 23 (MOSI) ↔ MCP2515 MOSI
-   - ESP32 GPIO 5 (CS)    ↔ MCP2515 CS
-   - GND ↔ GND
-   - 3.3V ↔ VCC
-
-3. **❌ Cristal oscillateur**
-   - MCP2515 requiert un cristal 8 MHz
-   - Vérifiez sa présence sur le module
-
-4. **❌ Alimentation insuffisante**
-   - MCP2515 requiert ~50 mA à 3.3V
-   - Vérifiez que l'alimentation est stable
-
-5. **⚠️ Conflit d'adresses SPI**
-   - Vérifiez que le CS pin (GPIO 5) n'est pas utilisé ailleurs
+### Configuration Vérifiée
+- Crystal : 16 MHz (✅ confirmé par ESPHome + GitHub)
+- Pins SPI : CS=10, SCK=12, MOSI=11, MISO=13, RST=9 (✅)
+- Pas de pin INT : polling SPI via checkReceive() (✅)
+- ESP-NOW : heartbeat 1s, broadcast ch1, reçu par l'Écran (✅)
 
 ---
 
 ## Checklist de Déploiement
 
-### Avant de Connecter la Tesla
+### Vérifié
 
-- [ ] Module MCP2515 procuré
-- [ ] Connexions SPI câblées et testées
-- [ ] Cristal 8 MHz présent sur le module
-- [ ] Alimentation 3.3V/GND vérifiée
-- [ ] Condensateurs de découplage (0.1µF) installés
+- [x] LilyGo T-2CAN bran ché via USB-C
+- [x] MCP2515 détecté (SPI OK)
+- [x] Crystal 16 MHz OK
+- [x] ESP-NOW broadcast OK (heartbeat 1s)
+- [x] Ecran reçoit les trames (bridgeSeen=1)
+- [ ] Test sur bus CAN réel (Tesla Model 3)
 
-### Câblage SPI (Important!)
+### Câblage SPI (Intégré sur T-2CAN)
 
 ```
-ESP32               MCP2515
-────────────────────────────
-GPIO 18 (SCK)  ──→  SCK
-GPIO 19 (MISO) ──→  SO (MISO)
-GPIO 23 (MOSI) ──→  SI (MOSI)
-GPIO 5 (CS)    ──→  CS
-GND            ──→  GND
-3.3V           ──→  VCC
+ESP32-S3 (on PCB)       MCP2515 (on PCB)
+────────────────────────────────────────
+GPIO 12 (SCK)   ──→  SCK
+GPIO 13 (MISO)  ──→  SO (MISO)
+GPIO 11 (MOSI)  ──→  SI (MOSI)
+GPIO 10 (CS)    ──→  CS
+GPIO 9  (RST)   ──→  RST
 ```
+Tout est routé sur le PCB — aucun câblage externe nécessaire.
 
 ### Câblage CAN (à la Tesla)
 

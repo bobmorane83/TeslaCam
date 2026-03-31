@@ -1,39 +1,44 @@
 # Environment Configuration - ESP32 CAN Project
 
 **Project Type:** Embedded CAN Communication System  
-**Date Created:** 22 février 2026  
-**Platform:** NodeMCU-ESP32 DEVKITV1
+**Date Created:** 22 février 2026 | **Updated:** Mars 2026  
+**Platform:** LilyGo T-2CAN v1.0 (ESP32-S3-WROOM-1U)
 
 ---
 
 ## Hardware Configuration
 
 ### Device Specifications
-- **MCU:** ESP32 (Dual-core, 240MHz each)
-- **RAM:** 520 KB (dynamic), 8 MB external (PSRAM optional)
-- **Flash:** 4 MB (typical)
-- **Connectivity:** WiFi 802.11 b/g/n, BLE 4.2
-- **GPIO Pins:** 34 input, 25 output (shared with some inputs)
+- **MCU:** ESP32-S3-WROOM-1U MCN16R8 (Dual-core LX7, 240MHz each)
+- **RAM:** 512 KB SRAM + 8 MB OPI PSRAM (integrated)
+- **Flash:** 16 MB QIO
+- **Connectivity:** WiFi 802.11 b/g/n, BLE 5.0
+- **USB:** USB-C JTAG/serial debug (CDC on boot)
 
 ### Connected Peripherals
-- **CAN Interface:** MCP2515 via SPI
+- **CAN Interface:** MCP2515 via SPI (integrated on T-2CAN PCB)
   - **Communication Speed:** 500 kbps
-  - **SPI Bus:** Standard (10 MHz typical)
-  - **Interrupt Pin:** GPIO required
-  - **CS Pin:** GPIO required
+  - **Crystal:** 16 MHz (onboard)
+  - **SPI Bus:** Standard
+  - **No INT pin** — SPI polling via `checkReceive()`
+  - **RST Pin:** GPIO 9 (hardware reset at boot)
 
-### Pin Allocation Guidelines
+### Pin Allocation (LilyGo T-2CAN)
 ```
-SPI Interface (MCP2515):
-- MOSI: GPIO 23 (default)
-- MISO: GPIO 19 (default)
-- SCK:  GPIO 18 (default)
-- CS:   GPIO 5 (configurable)
-- INT:  GPIO 4 (configurable)
+SPI Interface (MCP2515 — routed on PCB):
+- MOSI: GPIO 11
+- MISO: GPIO 13
+- SCK:  GPIO 12
+- CS:   GPIO 10
+- RST:  GPIO 9
+- INT:  Not connected (SPI polling)
 
-Other Interfaces:
-- Serial/Debug: GPIO 1 (TX), GPIO 3 (RX) @ 115200 baud
-- Spare GPIOs: 2, 14, 15, 25-27, 32-39
+CAN Bus (onboard screw terminal):
+- CAN_H / CAN_L
+
+Other:
+- Serial/Debug: USB-C JTAG/CDC @ 115200 baud
+- TWAI: GPIO 7 (TX), GPIO 6 (RX) — not used (MCP2515 preferred)
 ```
 
 ---
@@ -48,20 +53,29 @@ Other Interfaces:
 
 ### Required Dependencies
 ```ini
-[env:esp32dev]
+[env:t2can]
 platform = espressif32
-board = esp32dev
+board = esp32-s3-devkitc-1
 framework = arduino
-board_build.mcu = esp32
+board_build.mcu = esp32s3
 board_build.f_cpu = 240000000L
-
-; Library configurations
-lib_deps =
-    hideakitai/MCP_CAN @ ^1.0.0
-    ArduinoJSON @ ^7.x  (optional)
+board_build.flash_mode = qio
+board_upload.flash_size = 16MB
+board_build.partitions = default_16MB.csv
+board_build.arduino.memory_type = qio_opi
 
 monitor_speed = 115200
-monitor_filters = esp32_exception_decoder
+upload_speed = 921600
+
+build_flags = 
+    -D DEBUG_LEVEL=2
+    -D BOARD_HAS_PSRAM
+    -D ARDUINO_USB_MODE=1
+    -D ARDUINO_USB_CDC_ON_BOOT=1
+    -O2
+
+lib_deps =
+    coryjfowler/MCP_CAN @ ^1.5.0
 ```
 
 ### Library Dependencies
@@ -281,20 +295,31 @@ setCpuFrequencyMhz(80);  // Default 240 MHz
 ### MCP2515 Setup
 ```cpp
 #include <MCP_CAN.h>
+#include <SPI.h>
 
-// SPI CS pin
-const int SPI_CS_PIN = 5;
-const int CAN_INT_PIN = 4;
+// SPI pins (LilyGo T-2CAN)
+#define MCP_CS_PIN    10
+#define MCP_SCK_PIN   12
+#define MCP_MOSI_PIN  11
+#define MCP_MISO_PIN  13
+#define MCP_RST_PIN   9
 
-// CAN speed: 500 kbps
-MCP_CAN CAN(SPI_CS_PIN);
+MCP_CAN CAN(MCP_CS_PIN);
 
 void setupCAN() {
-    if (CAN.begin(MCP_500KBPS, MCP_8MHZ) == CAN_OK) {
-        // Set CAN mode to LOOPBACK/NORMAL/SLEEP/LISTEN
-        CAN.setMode(MCP_NORMAL);
-        // Setup masks and filters as needed
-        CAN.init_Mask(0, 0, 0x7FF);  // Mask for std ID
+    // Hardware reset MCP2515
+    pinMode(MCP_RST_PIN, OUTPUT);
+    digitalWrite(MCP_RST_PIN, HIGH);
+    delay(100);
+    digitalWrite(MCP_RST_PIN, LOW);
+    delay(100);
+    digitalWrite(MCP_RST_PIN, HIGH);
+    delay(100);
+
+    SPI.begin(MCP_SCK_PIN, MCP_MISO_PIN, MCP_MOSI_PIN, MCP_CS_PIN);
+
+    if (CAN.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) == CAN_OK) {
+        CAN.setMode(MCP_LISTENONLY);  // Listen-only for Tesla
     }
 }
 ```

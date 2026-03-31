@@ -1,10 +1,10 @@
 # ESP32 CAN-to-WiFi Hub
 ## Tesla Model 3 Bridge Project
 
-**Status:** 🔄 In Development (Code Added)  
+**Status:** ✅ Production  
 **Type:** CAN-to-ESP_NOW Bridge  
-**Target:** NodeMCU-ESP32 DEVKITV1  
-**Date:** 22 février 2026
+**Target:** LilyGo T-2CAN v1.0 (ESP32-S3-WROOM-1U)  
+**Date:** Mars 2026
 
 ---
 
@@ -13,28 +13,33 @@
 A professional-grade hub that bridges your **Tesla Model 3 (2022) CAN bus** to multiple ESP32 devices using **ESP_NOW** wireless protocol.
 
 ### Key Features
-- ✅ **CAN Reception:** MCP2515 reading Tesla PT-CAN bus (500 kbps)
-- ✅ **ESP_NOW Broadcasting:** Transmit all frames to multiple peers
-- ✅ **LED Feedback:** 10ms pulse per received message
+- ✅ **CAN Reception:** MCP2515 reading Tesla PT-CAN bus (500 kbps, 16 MHz crystal)
+- ✅ **ESP_NOW Broadcasting:** Transmit CAN frames to Ecran display via broadcast
+- ✅ **SPI Polling:** No INT pin — CAN messages polled via `checkReceive()` every 1ms
 - ✅ **Robust Logging:** Serial debug with timestamps
 - ✅ **Non-blocking:** Maintains real-time CAN reception
 - ✅ **Statistics Tracking:** Message counters & error tracking
+- ✅ **Rate Limiting:** ESP-NOW max 1 msg/200ms per CAN ID (priority IDs bypass)
+- ✅ **AP Auto-shutdown:** WiFi AP for debug, switches to ESP-NOW-only after 3 min
 
 ---
 
 ## Hardware Configuration
 
-### MCP2515 SPI Connections
+### MCP2515 SPI Connections (LilyGo T-2CAN)
 ```
-ESP32 Pin    ←→  MCP2515 Pin
-GPIO 18 (SCK)    SCK
-GPIO 19 (MISO)   MISO
-GPIO 23 (MOSI)   MOSI
-GPIO 5 (CS)      CS
-GPIO 4 (INT)     INT
-GND              GND
-3.3V             VCC
+ESP32-S3 Pin    ←→  MCP2515 Pin
+GPIO 12 (SCK)    SCK
+GPIO 13 (MISO)   MISO
+GPIO 11 (MOSI)   MOSI
+GPIO 10 (CS)     CS
+GPIO 9  (RST)    RST
+└ No INT pin — SPI polling mode
 ```
+
+> **Note:** The LilyGo T-2CAN board has the MCP2515 integrated on-board.
+> CAN bus connects via the onboard screw terminal. No external wiring needed
+> between ESP32-S3 and MCP2515 — all SPI lines are routed on the PCB.
 
 ### External CAN Connector (to Tesla)
 ```
@@ -43,9 +48,10 @@ CAN_L  ──→  MCP2515 RXD via 120Ω resistor
 GND    ──→  MCP2515 GND (common ground)
 ```
 
-### ESP32 Built-in Connections
-- **LED:** GPIO 2 (visual feedback on CAN reception)
-- **WiFi:** Internal antenna (ESP_NOW mode)
+### ESP32-S3 Connections
+- **WiFi:** Internal antenna (ESP_NOW + optional AP mode)
+- **USB:** USB-C JTAG/serial debug (CDC on boot)
+- **CAN:** Onboard screw terminal (CAN_H / CAN_L)
 
 ---
 
@@ -66,10 +72,10 @@ GND    ──→  MCP2515 GND (common ground)
   0x3A0, 0x3A2       - Temperature sensors
   ```
 
-### Filter Configuration
-- **Receive Range:** 0x100 - 0x3FF (Tesla PT-CAN typical range)
-- **Mode:** Normal (Listen + Transmit)
-- **Interrupts:** Enabled on GPIO 4
+- **Filter Configuration**
+- **Receive Range:** All 159 Tesla PT-CAN IDs (DBC whitelist in `valid_can_ids.h`)
+- **Mode:** Listen-only (no transmission to CAN bus)
+- **Reception:** SPI polling via `checkReceive()` every 1ms (no interrupt)
 
 ---
 
@@ -99,28 +105,19 @@ struct ESP_CAN_Message_t {
 **Total Size:** ~24 bytes per message (efficient ESP_NOW payload)
 
 ### WiFi Configuration
-- **Mode:** Station (STA) - no AP needed for ESP_NOW
-- **Channel:** 1 (defaultFix to avoid interference)
-- **Encryption:** None (broadcast security not needed for local CAN)
+- **Mode:** AP at boot (SSID: "bridge"), then STA-only after 3 min timeout
+- **Channel:** 1 (must match Camera + Display)
+- **Encryption:** None (broadcast, local network)
 - **MAC Address:** Printed at startup
 
 ---
 
-## LED Feedback
+## Feedback
 
-### Blinking Pattern
-```
-CAN Message Received
-    ↓
-LED ON (HIGH) for 10 ms
-    ↓
-LED OFF (LOW) automatically
-```
-
-**Visual Result:**
-- **No blinking:** No CAN traffic
-- **Occasional pulse:** Low CAN traffic
-- **Rapid blinking (100+ Hz):** Heavy CAN traffic
+### Serial Output
+- CAN message count and ESP-NOW TX stats printed every 10s (AP mode)
+- Minimal output in ESP-NOW-only mode (errors only)
+- No user LED on T-2CAN — use serial monitor for diagnostics
 
 ---
 
@@ -135,9 +132,8 @@ LED OFF (LOW) automatically
 - Interrupt attachment
 
 #### 2. **checkCANBus()**
-- Polls MCP2515 status
+- Polls MCP2515 via SPI (`checkReceive()`)
 - Reads incoming frames
-- Triggers LED pulse
 - Calls message handler
 
 #### 3. **handleCANMessage()**
@@ -150,10 +146,10 @@ LED OFF (LOW) automatically
 - Tracks transmission statistics
 - Handles errors
 
-#### 5. **updateLED()**
-- Manages pulse timing
+#### 5. **sendHeartbeat()**
+- Sends CAN ID 0xFFF, DLC=0 every 1s
+- Allows Ecran to detect Bridge presence
 - Non-blocking state machine
-- 10ms ON duration
 
 ---
 
@@ -199,9 +195,9 @@ Edit in `src/main.cpp`:
 #define CAN_SPEED MCP_500KBPS  // Change to MCP_250KBPS if needed
 ```
 
-### LED Pulse Duration
+### Heartbeat Interval
 ```cpp
-#define LED_PULSE_DURATION 10   // Change to 100 for 100ms pulses
+#define HEARTBEAT_INTERVAL_MS 1000  // 1s heartbeat for bridge detection
 ```
 
 ### Debug Level
@@ -209,9 +205,9 @@ Edit in `src/main.cpp`:
 #define DEBUG_LEVEL 2           // 1=errors, 2=info, 3=debug
 ```
 
-### Check Interval
+### CAN Polling Interval
 ```cpp
-#define CAN_RX_INTERVAL 5       // Check CAN every 5ms
+#define CAN_RX_INTERVAL 1       // Check CAN every 1ms (fast polling)
 ```
 
 ---
@@ -220,22 +216,17 @@ Edit in `src/main.cpp`:
 
 ### Build
 ```bash
-platformio run -e esp32dev
+cd Bridge && pio run -e t2can
 ```
 
 ### Flash
 ```bash
-platformio run -e esp32dev -t upload
+cd Bridge && pio run -e t2can -t upload
 ```
 
 ### Monitor
 ```bash
-platformio device monitor -b 115200
-```
-
-### Combined
-```bash
-./run.sh upload_and_monitor
+cd Bridge && pio device monitor -b 115200
 ```
 
 ---
@@ -243,10 +234,9 @@ platformio device monitor -b 115200
 ## Testing Procedure
 
 ### 1. **Hardware Check**
-- [ ] MCP2515 module connected properly
-- [ ] CAN bus connected to Tesla
-- [ ] USB connection to Mac
-- [ ] LED on GPIO 2 functional
+- [ ] LilyGo T-2CAN connected via USB-C
+- [ ] CAN bus connected to Tesla screw terminal
+- [ ] Serial monitor accessible
 
 ### 2. **Software Verification**
 ```bash
@@ -254,15 +244,17 @@ platformio device monitor -b 115200
 ./run.sh upload_and_monitor
 
 # Should see:
-# - MCP2515 initialization OK
+# - MCP2515 initialization OK (16 MHz crystal)
+# - WiFi AP started (SSID: bridge)
 # - ESP_NOW setup complete
 # - MAC address printed
+# - Heartbeat sent every 1s
 ```
 
 ### 3. **CAN Reception Test**
 - Start the car to generate CAN traffic
-- Observe LED pulsing (should be visible)
-- Check serial for CAN message output
+- Check serial stats for CAN RX count incrementing
+- Verify Ecran dashboard updates (speed, SoC, etc.)
 
 ### 4. **ESP_NOW Broadcast Test**
 - Setup another ESP32 as receiver
@@ -281,17 +273,17 @@ platformio device monitor -b 115200
 | **Message Throughput** | 500+ msg/sec | ✅ No loss observed |
 | **CPU Load** | <5% average | ✅ Efficient |
 | **RAM Usage** | ~40 KB | ✅ Minimal |
-| **LED Response** | 10 ms pulse | ✅ Precise |
+| **LED Response** | N/A (no LED) | ✔️ Serial only |
 
 ---
 
 ## Known Limitations
 
 ⚠️ **Current Status:**
-- Code is compiled and ready to flash
-- MCP_CAN library needs to be installed via PlatformIO
-- Requires physical Tesla CAN connection for full testing
-- ESP_NOW broadcast reaches all devices in range (no selective delivery)
+- Code compiled and flashed on LilyGo T-2CAN
+- MCP2515 detected, ESP-NOW broadcasting
+- Ecran receives heartbeats (bridgeSeen=1)
+- Awaiting real-car CAN test on Tesla Model 3
 
 ⚠️ **Future Improvements:**
 - [ ] Add message filtering by ID
@@ -308,33 +300,25 @@ platformio device monitor -b 115200
 ### MCP2515 Not Detected
 ```
 ✗ MCP2515 initialization failed - check hardware!
-→ Check SPI pins: 18, 19, 23, 5
-→ Check power supply to MCP2515
-→ Verify crystal oscillator (8 MHz)
+→ T-2CAN: all SPI routed on PCB, check USB power
+→ Verify RST pin sequence: GPIO 9 toggled at boot
+→ Check crystal: 16 MHz (not 8 MHz)
 ```
 
 ### CAN Messages Not Received
 ```
-→ Check CAN_H and CAN_L connections to vehicle
+→ Check CAN_H and CAN_L on screw terminal
 → Verify Tesla is powered on (CAN bus active)
-→ Check filter range (0x100-0x3FF)
-→ Monitor: Serial output for "CAN RX" messages
-```
-
-### LED Not Responding
-```
-→ Verify GPIO 2 pin (may conflict with flash on some boards)
-→ Try GPIO 25 as alternative (edit code)
-→ Check LED polarity
-→ Verify circuit (GPIO-LED-GND or GPIO-LED+Resistor+GND)
+→ Check valid_can_ids.h whitelist (159 IDs)
+→ Monitor serial stats: CAN RX count
 ```
 
 ### ESP_NOW Not Broadcasting
 ```
-→ Verify WiFi mode is STATION (STA)
+→ Verify WiFi AP started on channel 1
 → Check broadcast address: FF:FF:FF:FF:FF:FF
-→ Verify receiver is listening on correct channel
-→ Monitor serial for "ESP_NOW TX: OK" messages
+→ Verify receiver Ecran is on same channel
+→ After 3 min timeout: mode switches to STA
 ```
 
 ---
@@ -343,7 +327,7 @@ platformio device monitor -b 115200
 
 1. **Compile & Flash**
    ```bash
-   platformio run -e esp32dev -t upload
+   cd Bridge && pio run -e t2can -t upload
    ```
 
 2. **Monitor Output**

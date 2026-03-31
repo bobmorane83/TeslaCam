@@ -12,14 +12,14 @@ Système embarqué de caméra de recul pour Tesla composé de deux ESP32-S3 comm
 |---|---|---|
 | **Camera** | Freenove ESP32-S3 WROOM | ESP32-S3, OV5640, 8 MB PSRAM OPI, Wi-Fi 802.11n |
 | **Écran** | JC3636W518C | ESP32-S3, ST77916 QSPI, 360×360 rond, 16 MB Flash, 8 MB PSRAM OPI |
-| **Bridge** | NodeMCU-ESP32 DEVKITV1 + MCP2515 | ESP32, MCP2515 SPI CAN controller, 8 MHz crystal, bus CAN 500 kbps |
+| **Bridge** | LilyGo T-2CAN v1.0 | ESP32-S3-WROOM-1U, MCP2515 SPI CAN controller, 16 MHz crystal, bus CAN 500 kbps, 16 MB Flash, 8 MB PSRAM OPI |
 
 ---
 
 ## 3. Architecture
 
 ```
-┌───────────────────────┐         Wi-Fi (SoftAP ch.6)   ┌───────────────────────┐
+┌───────────────────────┐         Wi-Fi (SoftAP ch.1)   ┌───────────────────────┐
 │   ESP32-S3 Camera     │ ────── UDP port 5000 ──────── │   ESP32-S3 Écran      │
 │                       │                                │                       │
 │  OV5640 (JPEG 360x360)│  Paquets UDP chunked          │  ST77916 360×360 rond │
@@ -29,10 +29,10 @@ Système embarqué de caméra de recul pour Tesla composé de deux ESP32-S3 comm
 └───────────────────────┘                                └───────────────────────┘
                                                                     ▲
                                                                     │ ESP-NOW
-                                                                    │ (channel 6)
+                                                                    │ (channel 1)
                                                          ┌──────────┴──────────┐
-                                                         │   ESP32 Bridge      │
-                                                         │                     │
+                                                         │  ESP32-S3 Bridge    │
+                                                         │  (LilyGo T-2CAN)   │
                                                          │  MCP2515 CAN 500kbps│
                                                          │  CAN → ESP-NOW      │
                                                          │  Trames Tesla M3    │
@@ -76,7 +76,7 @@ Basé sur l'analyse du Guide.txt, le protocole **SoftAP + UDP raw** est retenu c
 | ECR-06 | Triple buffering frames | Trois buffers JPEG en PSRAM (réception / prêt / affichage) avec mutex FreeRTOS, pour éviter les artefacts et la perte de paquets. |
 | ECR-07 | Activation/désactivation par toucher | Un appui sur l'écran tactile envoie une commande `START` à la Camera (UDP). Un second appui envoie `STOP`. L'état bascule à chaque toucher (toggle). Quand le streaming est inactif, l'écran affiche un indicateur visuel (ex: icône caméra barrée ou texte "Appuyez pour activer"). |
 | ECR-08 | Commande UDP de contrôle | Envoie les commandes `START` / `STOP` à la Camera via UDP port `5001` (port de contrôle distinct du port vidéo `5000`). |
-| ECR-09 | Réception ESP-NOW du Bridge | Reçoit les trames CAN transmises par le Bridge via ESP-NOW (broadcast, canal 6). Décode 7 signaux CAN : vitesse (0x257), rapport (0x118), SoC (0x292), range (0x33A), temp batterie (0x312), puissance arrière (0x266), puissance avant (0x2E5). Structure extensible pour ajout futur de signaux. |
+| ECR-09 | Réception ESP-NOW du Bridge | Reçoit les trames CAN transmises par le Bridge via ESP-NOW (broadcast, canal 1). Décode 7 signaux CAN : vitesse (0x257), rapport (0x118), SoC (0x292), range (0x33A), temp batterie (0x312), puissance arrière (0x266), puissance avant (0x2E5). Structure extensible pour ajout futur de signaux. |
 | ECR-10 | Dashboard instrument cluster | Affiche un tableau de bord complet inspiré du mockup HTML (`Ecran/mockup/ev_round_display.html`) : arc de vitesse coloré (teal→ambre→rouge, 0-180 km/h), arc SoC batterie, sélecteur de rapport P/R/N/D avec couleurs, vitesse en grand (FreeSansBold 24pt × 3), autonomie en km, température batterie °C, pourcentage SoC, barre de régénération 0-50 kW avec lissage. Bezel statique pré-rendu en PSRAM (ticks, numéros, labels) + éléments dynamiques recalculés à 10 Hz. |
 | ECR-11 | Indicateurs de connexion | Deux points colorés en haut de l'écran indiquent l'état de connexion : **gauche** = Bridge (vert connecté, rouge déconnecté, orange clignotant en recherche), **droite** = Camera (vert connecté, rouge déconnecté). Visibles sur le dashboard ET en overlay sur le flux vidéo. |
 | ECR-12 | WiFi non-bloquant | La connexion WiFi à la Camera est non-bloquante : le dashboard s'affiche immédiatement au démarrage. La pile réseau (UDP, ESP-NOW) est initialisée quand la connexion aboutit. Reconnexion automatique en arrière-plan. |
@@ -85,11 +85,11 @@ Basé sur l'analyse du Guide.txt, le protocole **SoftAP + UDP raw** est retenu c
 
 | ID | Exigence | Détail |
 |---|---|---|
-| BRG-01 | Lire le bus CAN Tesla | MCP2515 en mode listen-only, 500 kbps, filtres matériels sur les IDs Tesla Model 3 (159 IDs DBC). |
-| BRG-02 | Émettre via ESP-NOW | Broadcast des trames CAN sous forme de `ESP_CAN_Message_t` (18 bytes packed) à tous les peers ESP-NOW sur canal 6. |
-| BRG-03 | Heartbeat | Émet une trame heartbeat (CAN ID 0xFFF, DLC 0) toutes les 2 secondes via ESP-NOW. |
-| BRG-04 | AP auto-shutdown | Démarre un AP Wi-Fi ("bridge") pour le debug. Si aucun client après 3 min, l'AP est coupé et le Bridge passe en mode ESP-NOW seul (économie CPU). |
-| BRG-05 | Canal Wi-Fi | Utilise le canal Wi-Fi 6, partagé avec le SoftAP Camera pour permettre la réception ESP-NOW par l'Écran. |
+| BRG-01 | Lire le bus CAN Tesla | MCP2515 en mode listen-only, 500 kbps, cristal 16 MHz, filtres logiciels sur les IDs Tesla Model 3 (159 IDs DBC). Pas de pin INT — polling SPI via `checkReceive()`. |
+| BRG-02 | Émettre via ESP-NOW | Broadcast des trames CAN sous forme de `ESP_CAN_Message_t` (18 bytes packed) à tous les peers ESP-NOW sur canal 1. Rate limiting : max 1 msg/200ms par CAN ID sauf IDs prioritaires. |
+| BRG-03 | Heartbeat | Émet une trame heartbeat (CAN ID 0xFFF, DLC 0) toutes les 1 seconde via ESP-NOW. |
+| BRG-04 | AP auto-shutdown | Démarre un AP Wi-Fi ("bridge") pour le debug/dashboard. Si aucun client après 3 min, l'AP est coupé et le Bridge passe en mode ESP-NOW seul (économie CPU). |
+| BRG-05 | Canal Wi-Fi | Utilise le canal Wi-Fi 1, partagé avec le SoftAP Camera pour permettre la réception ESP-NOW par l'Écran. |
 
 ---
 
@@ -141,7 +141,7 @@ Basé sur l'analyse du Guide.txt, le protocole **SoftAP + UDP raw** est retenu c
 └─────────────────────────────────────────┘
 ```
 
-- **Transport** : ESP-NOW broadcast (FF:FF:FF:FF:FF:FF) sur canal Wi-Fi 6
+- **Transport** : ESP-NOW broadcast (FF:FF:FF:FF:FF:FF) sur canal Wi-Fi 1
 - **Débit** : ~1000 trames CAN/s (filtré par whitelist DBC)
 - **Signaux CAN décodés par l'Écran** :
   - `DI_uiSpeed` (CAN 0x257) : bit 24, 9 bits — vitesse affichée
@@ -153,7 +153,7 @@ Basé sur l'analyse du Guide.txt, le protocole **SoftAP + UDP raw** est retenu c
   - `RearPower266` (CAN 0x266) : bit 0, 11 bits signé, ×0.5 — kW
   - `FrontPower2E5` (CAN 0x2E5) : bit 0, 11 bits signé, ×0.5 — kW
   - Regen = −(rear+front power) quand négatif, lissage exponentiel 0.72/0.28
-- **Heartbeat** : CAN ID `0xFFF`, DLC=0, toutes les 2s
+- **Heartbeat** : CAN ID `0xFFF`, DLC=0, toutes les 1s
 
 ---
 
