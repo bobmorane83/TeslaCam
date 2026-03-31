@@ -1161,19 +1161,25 @@ void sendCtrlCommand(const char *cmd) {
  * ====================================================================== */
 void udpRecvTask(void *pvParameters);
 
+/* Re-pin ESP-NOW channel after STA disconnect/scan failure */
+static void onWiFiStaDisconnected(WiFiEvent_t event, WiFiEventInfo_t info) {
+    esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+}
+
 void startWiFi() {
     WiFi.mode(WIFI_STA);
+    WiFi.onEvent(onWiFiStaDisconnected, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
 
     /* Initialize ESP-NOW early on configured channel */
     esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
     initESPNOW();
 
     WiFi.config(STATIC_IP, GATEWAY, SUBNET);
-    WiFi.begin(AP_SSID);
+    WiFi.begin(AP_SSID, nullptr, WIFI_CHANNEL);
     WiFi.setSleep(false);
     WiFi.setAutoReconnect(false);  // Prevent background channel scanning
     esp_wifi_set_max_tx_power(78);  // Max TX power (19.5 dBm) for EMI resilience
-    Serial.printf("[WIFI] Connecting to %s (non-blocking)\n", AP_SSID);
+    Serial.printf("[WIFI] Connecting to %s on ch %d (non-blocking)\n", AP_SSID, WIFI_CHANNEL);
 }
 
 void setupNetwork() {
@@ -1459,13 +1465,11 @@ void loop() {
         Serial.println("[WIFI] Disconnected");
     }
 
-    /* ── Manual WiFi reconnect (avoid constant channel scanning) ── */
+    /* ── Manual WiFi reconnect (scan only channel 1 to preserve ESP-NOW) ── */
     static unsigned long lastWifiRetry = 0;
     if (!wifiConnected && (now - lastWifiRetry >= 15000)) {
         lastWifiRetry = now;
-        WiFi.begin(AP_SSID);
-        /* Re-pin ESP-NOW channel after WiFi scan */
-        esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+        WiFi.begin(AP_SSID, nullptr, WIFI_CHANNEL);
     }
 
     /* ── Touch toggle ── */
