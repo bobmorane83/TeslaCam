@@ -162,6 +162,7 @@ static volatile struct {
 static volatile unsigned long lastBridgeMsg = 0;
 static volatile bool bridgeEverSeen = false;
 static volatile bool espNowPaused = false;
+static volatile uint32_t espNowRxCount = 0;  // debug counter
 
 static float regenKwSmooth = 0;
 #define MAX_REGEN_KW 80.0f
@@ -940,6 +941,7 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
     if ((size_t)len != sizeof(ESP_CAN_Message_t)) return;
     const ESP_CAN_Message_t *m = (const ESP_CAN_Message_t *)data;
 
+    espNowRxCount++;
     lastBridgeMsg = millis();
     bridgeEverSeen = true;
 
@@ -1164,6 +1166,8 @@ void udpRecvTask(void *pvParameters);
 /* Re-pin ESP-NOW channel after STA disconnect/scan failure */
 static void onWiFiStaDisconnected(WiFiEvent_t event, WiFiEventInfo_t info) {
     esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    Serial.printf("[WIFI] STA disconnected (reason %d) — channel re-pinned to %d\n",
+                  info.wifi_sta_disconnected.reason, WIFI_CHANNEL);
 }
 
 void startWiFi() {
@@ -1446,12 +1450,14 @@ void loop() {
     static unsigned long lastHB = 0;
     if (now - lastHB >= 5000) {
         lastHB = now;
+        uint8_t pCh = 0; wifi_second_chan_t sCh;
+        esp_wifi_get_channel(&pCh, &sCh);
 #if FEATURE_TURN_SIGNAL
-        Serial.printf("[HB] %lums stream=%d bridgeSeen=%d mode=%d armed=%lu\n",
-                      now, streamActive, (int)bridgeEverSeen, turnMode, turnArmedMs);
+        Serial.printf("[HB] %lums stream=%d bridgeSeen=%d mode=%d armed=%lu ch=%d espnow_rx=%lu\n",
+                      now, streamActive, (int)bridgeEverSeen, turnMode, turnArmedMs, pCh, espNowRxCount);
 #else
-        Serial.printf("[HB] %lums stream=%d bridgeSeen=%d soc=%d range=%d\n",
-                      now, streamActive, (int)bridgeEverSeen, canData.soc, canData.rangeKm);
+        Serial.printf("[HB] %lums stream=%d bridgeSeen=%d soc=%d range=%d ch=%d espnow_rx=%lu\n",
+                      now, streamActive, (int)bridgeEverSeen, canData.soc, canData.rangeKm, pCh, espNowRxCount);
 #endif
     }
 
@@ -1467,7 +1473,7 @@ void loop() {
 
     /* ── Manual WiFi reconnect (scan only channel 1 to preserve ESP-NOW) ── */
     static unsigned long lastWifiRetry = 0;
-    if (!wifiConnected && (now - lastWifiRetry >= 15000)) {
+    if (!wifiConnected && (now - lastWifiRetry >= 30000)) {
         lastWifiRetry = now;
         WiFi.begin(AP_SSID, nullptr, WIFI_CHANNEL);
     }

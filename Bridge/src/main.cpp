@@ -70,7 +70,7 @@
 #define CAN_RX_INTERVAL   1     // Check CAN bus every 1ms (fast polling)
 #define STATS_INTERVAL    10000 // Print stats every 10s
 #define DEBUG_LEVEL       2     // 1=ERROR, 2=INFO, 3=DEBUG
-#define HEARTBEAT_INTERVAL_MS 2000 // Send heartbeat every 2s via ESP-NOW
+#define HEARTBEAT_INTERVAL_MS 1000 // Send heartbeat every 1s via ESP-NOW
 #define HEARTBEAT_CAN_ID  0xFFF    // Special ID for bridge heartbeat
 
 // ───────────────────────────────────────────────────────────────────────────
