@@ -983,12 +983,15 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
     case CAN_ID_BMS_SOC:
         if (m->dlc >= 4) {
             /* SOCUI292: start_bit 10, 10 bits, LE unsigned, factor 0.1, offset 0
-             * This is the BMS-reported SoC — used directly as displayed %. */
+             * This is the BMS-reported SoC — needs buffer correction for displayed %.
+             * Tesla reserves ~7.3% bottom capacity (calibrated: BMS 62% = display 59%). */
             uint16_t rawSoc = ((m->data[1] >> 2) & 0x3F) | ((uint16_t)(m->data[2] & 0x0F) << 6);
-            float socPct = rawSoc * 0.1f;
-            uint8_t socRounded = (uint8_t)(socPct + 0.5f);
-            if (socRounded > 100) socRounded = 100;
-            Serial.printf("[CAN] 0x292 SOCUI=%.1f%% → %u%%\n", socPct, socRounded);
+            float bmsPct = rawSoc * 0.1f;
+            float displayPct = (bmsPct - 7.3f) / (100.0f - 7.3f) * 100.0f;
+            if (displayPct < 0.0f) displayPct = 0.0f;
+            if (displayPct > 100.0f) displayPct = 100.0f;
+            uint8_t socRounded = (uint8_t)(displayPct + 0.5f);
+            Serial.printf("[CAN] 0x292 BMS=%.1f%% → display=%u%%\n", bmsPct, socRounded);
             canData.soc = socRounded;
         }
         break;
