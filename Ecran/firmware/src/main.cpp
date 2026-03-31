@@ -118,7 +118,6 @@ typedef struct __attribute__((packed)) {
 #define CAN_ID_COOLANT_TEMP 0x321
 #define CAN_ID_REAR_PWR    0x266
 #define CAN_ID_FRONT_PWR 0x2E5
-#define CAN_ID_BMS_SOC   0x292
 #define CAN_ID_UTC_TIME  0x318
 #define CAN_ID_THS_STATUS  0x383
 #define CAN_ID_UI_WARNING  0x311
@@ -150,14 +149,13 @@ static volatile struct {
     uint8_t  utcMonth;
     uint8_t  utcYear;
     bool     timeReceived;
-    bool     soc33aReceived;
     float    outdoorTemp;
     bool     outdoorTempReceived;
     float    cabinTemp;
     bool     cabinTempReceived;
     bool     leftTurnOn;
     bool     rightTurnOn;
-} canData = { 0, GEAR_P, 0, 0, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0, 0, 0, 0, 0, false, false, 0.0f, false, 0.0f, false, false, false };
+} canData = { 0, GEAR_P, 0, 0, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0, 0, 0, 0, 0, false, 0.0f, false, 0.0f, false, false, false };
 
 #define BRIDGE_TIMEOUT_MS 10000
 static volatile unsigned long lastBridgeMsg = 0;
@@ -976,26 +974,7 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
             Serial.printf("[CAN] 0x33A rangeMi=%u rangeKm=%u SOC=%u SOE=%u\n",
                 rangeMi, canData.rangeKm, uiSoc, uiSoe);
             /* Use UI_uSOE (State of Energy) — matches the displayed % on the car */
-            if (uiSoe >= 1 && uiSoe <= 100) {
-                canData.soc = uiSoe;
-                canData.soc33aReceived = true;
-            }
-        }
-        break;
-
-    case CAN_ID_BMS_SOC:
-        if (m->dlc >= 4) {
-            /* SOCUI292: bit 10, 10 bits, factor 0.1 — raw BMS SoC includes ~5% bottom buffer */
-            uint16_t rawSoc = ((m->data[1] >> 2) & 0x3F) | ((uint16_t)(m->data[2] & 0x0F) << 6);
-            float socFloat = rawSoc * 0.1f;
-            /* Apply buffer correction: bottom ~5%, no degradation (health 100%) */
-            float displayedSoc = (socFloat - 5.0f) / 95.0f * 100.0f;
-            if (displayedSoc < 0.0f) displayedSoc = 0.0f;
-            if (displayedSoc > 100.0f) displayedSoc = 100.0f;
-            /* BMS SOC fallback — only use if 0x33A hasn't provided UI_uSOE yet */
-            if (!canData.soc33aReceived) {
-                canData.soc = (uint8_t)(displayedSoc + 0.5f);
-            }
+            if (uiSoe >= 1 && uiSoe <= 100) canData.soc = uiSoe;
         }
         break;
 
