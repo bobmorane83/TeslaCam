@@ -118,6 +118,7 @@ typedef struct __attribute__((packed)) {
 #define CAN_ID_COOLANT_TEMP 0x321
 #define CAN_ID_REAR_PWR    0x266
 #define CAN_ID_FRONT_PWR 0x2E5
+#define CAN_ID_BMS_SOC   0x292
 #define CAN_ID_UTC_TIME  0x318
 #define CAN_ID_THS_STATUS  0x383
 #define CAN_ID_UI_WARNING  0x311
@@ -973,8 +974,22 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
             uint8_t uiSoe = (m->data[7]) & 0x7F;
             Serial.printf("[CAN] 0x33A rangeMi=%u rangeKm=%u SOC=%u SOE=%u\n",
                 rangeMi, canData.rangeKm, uiSoc, uiSoe);
-            /* Use UI_uSOE (State of Energy) — matches the displayed % on the car */
-            if (uiSoe >= 1 && uiSoe <= 100) canData.soc = uiSoe;
+            /* NOTE: UI_SOC (111) and UI_uSOE (77) from DBC are unreliable —
+             * neither matches the displayed SoC. Range (bits 0-9) is correct.
+             * SoC comes from SOCUI292 (0x292) instead. */
+        }
+        break;
+
+    case CAN_ID_BMS_SOC:
+        if (m->dlc >= 4) {
+            /* SOCUI292: start_bit 10, 10 bits, LE unsigned, factor 0.1, offset 0
+             * This is the BMS-reported SoC — used directly as displayed %. */
+            uint16_t rawSoc = ((m->data[1] >> 2) & 0x3F) | ((uint16_t)(m->data[2] & 0x0F) << 6);
+            float socPct = rawSoc * 0.1f;
+            uint8_t socRounded = (uint8_t)(socPct + 0.5f);
+            if (socRounded > 100) socRounded = 100;
+            Serial.printf("[CAN] 0x292 SOCUI=%.1f%% → %u%%\n", socPct, socRounded);
+            canData.soc = socRounded;
         }
         break;
 

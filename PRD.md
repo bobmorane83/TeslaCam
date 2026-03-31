@@ -76,7 +76,7 @@ Basé sur l'analyse du Guide.txt, le protocole **SoftAP + UDP raw** est retenu c
 | ECR-06 | Triple buffering frames | Trois buffers JPEG en PSRAM (réception / prêt / affichage) avec mutex FreeRTOS, pour éviter les artefacts et la perte de paquets. |
 | ECR-07 | Activation/désactivation par toucher | Un appui sur l'écran tactile envoie une commande `START` à la Camera (UDP). Un second appui envoie `STOP`. L'état bascule à chaque toucher (toggle). Quand le streaming est inactif, l'écran affiche un indicateur visuel (ex: icône caméra barrée ou texte "Appuyez pour activer"). |
 | ECR-08 | Commande UDP de contrôle | Envoie les commandes `START` / `STOP` à la Camera via UDP port `5001` (port de contrôle distinct du port vidéo `5000`). |
-| ECR-09 | Réception ESP-NOW du Bridge | Reçoit les trames CAN transmises par le Bridge via ESP-NOW (broadcast, canal 6). Décode 6 signaux CAN : vitesse (0x257), rapport (0x118), SoC+range (0x33A), temp batterie (0x312), puissance arrière (0x266), puissance avant (0x2E5). Structure extensible pour ajout futur de signaux. |
+| ECR-09 | Réception ESP-NOW du Bridge | Reçoit les trames CAN transmises par le Bridge via ESP-NOW (broadcast, canal 6). Décode 7 signaux CAN : vitesse (0x257), rapport (0x118), SoC (0x292), range (0x33A), temp batterie (0x312), puissance arrière (0x266), puissance avant (0x2E5). Structure extensible pour ajout futur de signaux. |
 | ECR-10 | Dashboard instrument cluster | Affiche un tableau de bord complet inspiré du mockup HTML (`Ecran/mockup/ev_round_display.html`) : arc de vitesse coloré (teal→ambre→rouge, 0-180 km/h), arc SoC batterie, sélecteur de rapport P/R/N/D avec couleurs, vitesse en grand (FreeSansBold 24pt × 3), autonomie en km, température batterie °C, pourcentage SoC, barre de régénération 0-50 kW avec lissage. Bezel statique pré-rendu en PSRAM (ticks, numéros, labels) + éléments dynamiques recalculés à 10 Hz. |
 | ECR-11 | Indicateurs de connexion | Deux points colorés en haut de l'écran indiquent l'état de connexion : **gauche** = Bridge (vert connecté, rouge déconnecté, orange clignotant en recherche), **droite** = Camera (vert connecté, rouge déconnecté). Visibles sur le dashboard ET en overlay sur le flux vidéo. |
 | ECR-12 | WiFi non-bloquant | La connexion WiFi à la Camera est non-bloquante : le dashboard s'affiche immédiatement au démarrage. La pile réseau (UDP, ESP-NOW) est initialisée quand la connexion aboutit. Reconnexion automatique en arrière-plan. |
@@ -146,8 +146,9 @@ Basé sur l'analyse du Guide.txt, le protocole **SoftAP + UDP raw** est retenu c
 - **Signaux CAN décodés par l'Écran** :
   - `DI_uiSpeed` (CAN 0x257) : bit 24, 9 bits — vitesse affichée
   - `DI_gear` (CAN 0x118) : bit 21, 3 bits — P=1, R=2, N=3, D=4, SNA=7
-  - `UI_SOC` (CAN 0x33A) : bit 48, 7 bits — SoC batterie %
+  - `SOCUI292` (CAN 0x292) : bit 10, 10 bits, ×0.1 — SoC batterie % (source primaire)
   - `UI_Range` (CAN 0x33A) : bit 0, 10 bits — autonomie en miles (×1.609 → km)
+  - ⚠️ `UI_SOC` (CAN 0x33A) : bit 48, 7 bits — **non fiable** (donne 111 au lieu du % réel)
   - `BMSmaxPackTemperature` (CAN 0x312) : bit 53, 9 bits, ×0.25−25 — °C
   - `RearPower266` (CAN 0x266) : bit 0, 11 bits signé, ×0.5 — kW
   - `FrontPower2E5` (CAN 0x2E5) : bit 0, 11 bits signé, ×0.5 — kW
