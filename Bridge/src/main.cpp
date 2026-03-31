@@ -8,24 +8,26 @@
 #include "valid_can_ids.h"  // Whitelist of 159 valid Tesla CAN IDs
 
 // =============================================================================
-// ESP32 CAN-to-WiFi Hub (Tesla Model 3)
+// ESP32-S3 CAN-to-WiFi Hub (Tesla Model 3)
 // Purpose: Bridge CAN bus to ESP32 devices via ESP_NOW + WiFi AP UDP stream
-// Target: NodeMCU-ESP32 DEVKITV1
+// Target: LilyGo T-2CAN (ESP32-S3, MCP2515)
 // =============================================================================
 
 // ───────────────────────────────────────────────────────────────────────────
-// PIN CONFIGURATION
+// PIN CONFIGURATION (LilyGo T-2CAN)
 // ───────────────────────────────────────────────────────────────────────────
-#define MCP_CS_PIN        25     // MCP2515 SPI Chip Select (GPIO 25)
-#define MCP_INT_PIN       26     // MCP2515 Interrupt (GPIO 26)
-#define LED_PIN           2      // Built-in LED (visual feedback)
+#define MCP_CS_PIN        10     // MCP2515 SPI Chip Select
+#define MCP_SCK_PIN       12     // SPI Clock
+#define MCP_MOSI_PIN      11     // SPI MOSI
+#define MCP_MISO_PIN      13     // SPI MISO
+#define MCP_RST_PIN       9      // MCP2515 Hardware Reset
 
 // ───────────────────────────────────────────────────────────────────────────
 // CAN CONFIGURATION
 // ───────────────────────────────────────────────────────────────────────────
 #define CAN_IDMOD         0              // 0 = standard 11-bit IDs
 #define CAN_SPEED         CAN_500KBPS    // 13 = 500 kbps (Tesla Model 3)
-#define CAN_CRYSTAL       MCP_8MHZ       // 2 = 8 MHz crystal (actual oscillator)
+#define CAN_CRYSTAL       MCP_16MHZ      // 16 MHz crystal (LilyGo T-2CAN)
 
 // ───────────────────────────────────────────────────────────────────────────
 // WiFi ACCESS POINT CONFIGURATION
@@ -59,9 +61,8 @@
 
 // ───────────────────────────────────────────────────────────────────────────
 // LED FEEDBACK CONFIGURATION
+// T-2CAN has no user LED — feedback via serial only
 // ───────────────────────────────────────────────────────────────────────────
-#define LED_PULSE_DURATION  10   // 10ms pulse when CAN message received
-#define LED_OFF_TIME        50   // Minimum time between pulses
 
 // ───────────────────────────────────────────────────────────────────────────
 // TIMING & BUFFERS
@@ -115,20 +116,12 @@ typedef struct __attribute__((packed)) {
     uint8_t  is_extended;   // 0=standard, 1=extended ID
 } ESP_CAN_Message_t;
 
-// LED state machine
-typedef struct {
-    bool is_on;
-    unsigned long pulse_start;
-    bool should_pulse;
-} LED_State_t;
-
 // ───────────────────────────────────────────────────────────────────────────
 // GLOBAL VARIABLES
 // ───────────────────────────────────────────────────────────────────────────
 
 MCP_CAN CAN(MCP_CS_PIN);
 WiFiUDP udp;
-LED_State_t led_state = {false, 0, false};
 
 volatile bool can_message_ready = false;
 unsigned long last_can_check = 0;
@@ -185,7 +178,6 @@ void transmitViaESPNOW(ESP_CAN_Message_t* msg);
 void sendHeartbeat(void);
 void bufferForUDP(ESP_CAN_Message_t* msg);
 void flushUDPBuffer(void);
-void updateLED(void);
 void printStatistics(void);
 void onESPNOWSend(const uint8_t* mac_addr, esp_now_send_status_t status);
 void onESPNOWReceive(const esp_now_recv_info_t *recv_info, const uint8_t* data, int data_len);
@@ -200,16 +192,13 @@ void setup() {
     delay(500);
 
     Serial.println("\n\n========================================");
-    Serial.println("  ESP32 CAN-to-WiFi Hub v3.0");
+    Serial.println("  ESP32-S3 CAN-to-WiFi Hub v4.0");
     Serial.println("  Tesla Model 3 Bridge");
-    Serial.println("  WiFi AP + Batched UDP");
+    Serial.println("  LilyGo T-2CAN (MCP2515)");
     Serial.println("========================================");
     Serial.print("Board: ");
     Serial.println(ARDUINO_BOARD);
     Serial.println("========================================\n");
-
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW);
 
     // Init subsystems in order
     initializeCAN();
@@ -265,11 +254,6 @@ void loop() {
         flushUDPBuffer();
     }
 
-    // Update LED pulse state machine (only when AP is active)
-    if (ap_active) {
-        updateLED();
-    }
-
     // Periodically refresh client count (only when AP is active)
     if (ap_active && (current_time - last_client_check >= CLIENT_CHECK_INTERVAL)) {
         last_client_check = current_time;
@@ -296,18 +280,29 @@ void loop() {
 // =============================================================================
 
 void initializeCAN(void) {
-    Serial.println("[CAN] Initializing MCP2515...");
+    Serial.println("[CAN] Initializing MCP2515 (T-2CAN)...");
 
-    SPI.begin(18, 19, 23, MCP_CS_PIN);
+    // Hardware reset MCP2515
+    pinMode(MCP_RST_PIN, OUTPUT);
+    digitalWrite(MCP_RST_PIN, HIGH);
+    delay(100);
+    digitalWrite(MCP_RST_PIN, LOW);
+    delay(100);
+    digitalWrite(MCP_RST_PIN, HIGH);
+    delay(100);
+
+    SPI.begin(MCP_SCK_PIN, MCP_MISO_PIN, MCP_MOSI_PIN, MCP_CS_PIN);
 
     byte init_result = CAN.begin(CAN_IDMOD, CAN_SPEED, CAN_CRYSTAL);
     if (init_result == CAN_OK) {
-        LOG_INFO("MCP2515 initialized @ 500 kbps");
+        LOG_INFO("MCP2515 initialized @ 500 kbps (16 MHz crystal)");
     } else {
         LOG_ERROR("MCP2515 init FAILED - check wiring!");
         while (1) {
-            digitalWrite(LED_PIN, HIGH); delay(200);
-            digitalWrite(LED_PIN, LOW);  delay(200);
+            Serial.println("[ERR] MCP2515 init failed, retrying in 2s...");
+            delay(2000);
+            init_result = CAN.begin(CAN_IDMOD, CAN_SPEED, CAN_CRYSTAL);
+            if (init_result == CAN_OK) break;
         }
     }
 
@@ -330,13 +325,8 @@ void initializeCAN(void) {
 
     CAN.setMode(MCP_LISTENONLY);  // CRITICAL: passive only, no TX, no ACK on bus
 
-    // Interrupt on CAN message arrival
-    pinMode(MCP_INT_PIN, INPUT);
-    attachInterrupt(digitalPinToInterrupt(MCP_INT_PIN), [] {
-        can_message_ready = true;
-    }, FALLING);
-
-    Serial.println("[CAN] Ready (500 kbps, HW filter: 0x100-0x5FF + 0x700-0x7FF, 97% DBC coverage)\n");
+    // T-2CAN: no INT pin — use polling only (checkReceive in loop)
+    Serial.println("[CAN] Ready (500 kbps, 16 MHz, HW filter, polling mode)\n");
 }
 
 void checkCANBus(void) {
@@ -366,7 +356,6 @@ void checkCANBus(void) {
         }
 
         handleCANMessage(can_id, dlc, data);
-        if (ap_active) led_state.should_pulse = true;
     } else {
         if (ap_active) stats_errors++;
     }
@@ -404,6 +393,7 @@ void handleCANMessage(uint32_t id, uint8_t dlc, uint8_t* data) {
     // Priority IDs bypass rate limiting entirely
     uint16_t idx = id & 0x7FF;
     bool priority = (id == 0x257 || id == 0x266 || id == 0x2E5 || id == 0x33A ||
+                     id == 0x292 ||
                      id == TURN_CAN_ID_UI || id == TURN_CAN_ID_3F5 || id == 0x249);
     if (priority || msg.timestamp - espnow_last_sent[idx] >= ESPNOW_MIN_INTERVAL_MS) {
         espnow_last_sent[idx] = msg.timestamp;
@@ -683,37 +673,13 @@ void shutdownAPAndStartESPNOW(void) {
     ap_active = false;
     ap_clients_count = 0;
 
-    // 7. Turn off LED and stop all debug output
-    digitalWrite(LED_PIN, LOW);
-    led_state.is_on = false;
-    led_state.should_pulse = false;
-
+    // 7. Stop all debug output in ESP_NOW-only mode
     Serial.println("\n========================================");
     Serial.println("  MODE: ESP_NOW ONLY");
     Serial.println("  All CPU dedicated to CAN → ESP_NOW");
     Serial.println("  LED: OFF  |  Serial: errors only");
     Serial.printf("  Free heap: %lu bytes\n", ESP.getFreeHeap());
     Serial.println("========================================\n");
-}
-
-// =============================================================================
-// LED CONTROL
-// =============================================================================
-
-void updateLED(void) {
-    unsigned long t = millis();
-
-    if (led_state.should_pulse) {
-        digitalWrite(LED_PIN, HIGH);
-        led_state.pulse_start = t;
-        led_state.is_on = true;
-        led_state.should_pulse = false;
-    }
-
-    if (led_state.is_on && (t - led_state.pulse_start >= LED_PULSE_DURATION)) {
-        digitalWrite(LED_PIN, LOW);
-        led_state.is_on = false;
-    }
 }
 
 // =============================================================================
