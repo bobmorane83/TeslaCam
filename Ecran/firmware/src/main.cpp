@@ -137,6 +137,7 @@ static volatile struct {
     uint16_t uiSpeed;
     uint8_t  gear;
     uint8_t  soc;
+    bool     socReceived;
     uint16_t rangeKm;
     float    battTempMax;
     float    battTempMin;
@@ -156,7 +157,7 @@ static volatile struct {
     bool     cabinTempReceived;
     bool     leftTurnOn;
     bool     rightTurnOn;
-} canData = { 0, GEAR_P, 0, 0, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0, 0, 0, 0, 0, false, 0.0f, false, 0.0f, false, false, false };
+} canData = { 0, GEAR_P, 0, false, 0, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0, 0, 0, 0, 0, false, 0.0f, false, 0.0f, false, false, false };
 
 #define BRIDGE_TIMEOUT_MS 10000
 static volatile unsigned long lastBridgeMsg = 0;
@@ -615,17 +616,17 @@ static void createDashboard(void) {
 
     /* ── SoC (bottom center) ── */
     lblSoc = lv_label_create(scr);
-    lv_label_set_text(lblSoc, "0%");
+    lv_label_set_text(lblSoc, "-%");
     lv_obj_set_style_text_font(lblSoc, &lv_font_montserrat_24, 0);
-    lv_obj_set_style_text_color(lblSoc, COL_TEAL, 0);
+    lv_obj_set_style_text_color(lblSoc, COL_GREY, 0);
     lv_obj_set_style_text_align(lblSoc, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(lblSoc, LV_ALIGN_BOTTOM_MID, 0, -74);
+    lv_obj_align(lblSoc, LV_ALIGN_BOTTOM_MID, 0, -76);
 
     lblSocLbl = lv_label_create(scr);
     lv_label_set_text(lblSocLbl, "BATTERIE");
     lv_obj_set_style_text_font(lblSocLbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(lblSocLbl, COL_TEXTDIM, 0);
-    lv_obj_align(lblSocLbl, LV_ALIGN_BOTTOM_MID, 0, -52);
+    lv_obj_align(lblSocLbl, LV_ALIGN_BOTTOM_MID, 0, -54);
 
     /* ── Regen bar ── */
     int barW = 100, barH = 4;
@@ -776,7 +777,7 @@ static void updateDashboard(void) {
     lv_obj_align(lblTemp, LV_ALIGN_BOTTOM_MID, 48, -76);
 
     /* SoC */
-    if (noConnection) {
+    if (noConnection || !canData.socReceived) {
         lv_label_set_text(lblSoc, "-%");
         lv_obj_set_style_text_color(lblSoc, COL_GREY, 0);
     } else {
@@ -786,7 +787,7 @@ static void updateDashboard(void) {
         lv_color_t sc = lvSocColor(soc);
         lv_obj_set_style_text_color(lblSoc, sc, 0);
     }
-    lv_obj_align(lblSoc, LV_ALIGN_BOTTOM_MID, 0, -74);
+    lv_obj_align(lblSoc, LV_ALIGN_BOTTOM_MID, 0, -76);
 
     /* Regen */
     {
@@ -997,6 +998,7 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
             uint8_t socRounded = (uint8_t)(displayPct + 0.5f);
             Serial.printf("[CAN] 0x292 BMS=%.1f%% → display=%u%%\n", bmsPct, socRounded);
             canData.soc = socRounded;
+            canData.socReceived = true;
         }
         break;
 
