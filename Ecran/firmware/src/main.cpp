@@ -234,10 +234,8 @@ static lv_obj_t *lblSpeedUnit;
 static lv_obj_t *lblTime;
 static lv_obj_t *lblRange;
 static lv_obj_t *lblRangeUnit;
-static lv_obj_t *lblRangeLbl;
 static lv_obj_t *lblTemp;
 static lv_obj_t *lblTempUnit;
-static lv_obj_t *lblTempLbl;
 static lv_obj_t *lblSoc;
 static lv_obj_t *lblSocLbl;
 static lv_obj_t *lblRegenLbl;
@@ -245,7 +243,9 @@ static lv_obj_t *lblRegenKw;
 
 /* Temperature labels (near time) */
 static lv_obj_t *lblCabinTemp;
+static lv_obj_t *lblCabinTempLbl;
 static lv_obj_t *lblOutdoorTemp;
+static lv_obj_t *lblOutdoorTempLbl;
 
 /* Regen bar */
 static lv_obj_t *barRegen;
@@ -540,20 +540,34 @@ static void createDashboard(void) {
     lv_obj_set_style_text_align(lblTime, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(lblTime, LV_ALIGN_CENTER, 0, -80);
 
-    /* ── Cabin temp (right of time) ── */
-    lblCabinTemp = lv_label_create(scr);
-    lv_label_set_text(lblCabinTemp, "--\xC2\xB0");
-    lv_obj_set_style_text_font(lblCabinTemp, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(lblCabinTemp, COL_GREY, 0);
-    lv_obj_align(lblCabinTemp, LV_ALIGN_CENTER, 55, -80);
-
-    /* ── Outdoor temp (left of time) ── */
+    /* ── Outdoor temp (left of speed, between speed and arc) ── */
     lblOutdoorTemp = lv_label_create(scr);
     lv_label_set_text(lblOutdoorTemp, "--\xC2\xB0");
-    lv_obj_set_style_text_font(lblOutdoorTemp, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(lblOutdoorTemp, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(lblOutdoorTemp, COL_GREY, 0);
     lv_obj_set_style_text_align(lblOutdoorTemp, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_obj_align(lblOutdoorTemp, LV_ALIGN_CENTER, -55, -80);
+    lv_obj_align(lblOutdoorTemp, LV_ALIGN_CENTER, -68, -30);
+
+    lblOutdoorTempLbl = lv_label_create(scr);
+    lv_label_set_text(lblOutdoorTempLbl, "Ext");
+    lv_obj_set_style_text_font(lblOutdoorTempLbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lblOutdoorTempLbl, COL_TEXTDIM, 0);
+    lv_obj_set_style_text_align(lblOutdoorTempLbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lblOutdoorTempLbl, LV_ALIGN_CENTER, -68, -8);
+
+    /* ── Cabin temp (right of speed, between speed and arc) ── */
+    lblCabinTemp = lv_label_create(scr);
+    lv_label_set_text(lblCabinTemp, "--\xC2\xB0");
+    lv_obj_set_style_text_font(lblCabinTemp, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(lblCabinTemp, COL_GREY, 0);
+    lv_obj_align(lblCabinTemp, LV_ALIGN_CENTER, 68, -30);
+
+    lblCabinTempLbl = lv_label_create(scr);
+    lv_label_set_text(lblCabinTempLbl, "Int");
+    lv_obj_set_style_text_font(lblCabinTempLbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lblCabinTempLbl, COL_TEXTDIM, 0);
+    lv_obj_set_style_text_align(lblCabinTempLbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lblCabinTempLbl, LV_ALIGN_CENTER, 68, -8);
 
     /* ── Speed value (large, centered) ── */
     lblSpeed = lv_label_create(scr);
@@ -569,47 +583,35 @@ static void createDashboard(void) {
     lv_obj_set_style_text_color(lblSpeedUnit, COL_TEAL, 0);
     lv_obj_align(lblSpeedUnit, LV_ALIGN_CENTER, 0, 14);
 
-    /* ── Range (left widget, inside battery arc) ── */
+    /* ── Range (left of SoC, between % and battery arc) ── */
     lblRange = lv_label_create(scr);
     lv_label_set_text(lblRange, "0");
-    lv_obj_set_style_text_font(lblRange, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_font(lblRange, &lv_font_montserrat_18, 0);
     lv_obj_set_style_text_color(lblRange, COL_BLUE, 0);
-    lv_obj_set_style_text_align(lblRange, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(lblRange, LV_ALIGN_CENTER, -72, -8);
+    lv_obj_set_style_text_align(lblRange, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_align(lblRange, LV_ALIGN_BOTTOM_MID, -48, -76);
 
     lblRangeUnit = lv_label_create(scr);
     lv_label_set_text(lblRangeUnit, "km");
     lv_obj_set_style_text_font(lblRangeUnit, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(lblRangeUnit, COL_BLUE, 0);
-    lv_obj_align(lblRangeUnit, LV_ALIGN_CENTER, -72, 10);
+    lv_obj_set_style_text_align(lblRangeUnit, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_align(lblRangeUnit, LV_ALIGN_BOTTOM_MID, -48, -58);
 
-    lblRangeLbl = lv_label_create(scr);
-    lv_label_set_text(lblRangeLbl, "AUTO-\nNOMIE");
-    lv_obj_set_style_text_font(lblRangeLbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(lblRangeLbl, COL_TEXTDIM, 0);
-    lv_obj_set_style_text_align(lblRangeLbl, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(lblRangeLbl, LV_ALIGN_CENTER, -72, 30);
-
-    /* ── Temp (right widget, inside battery arc) ── */
+    /* ── Batt temp (right of SoC, between % and battery arc) ── */
     lblTemp = lv_label_create(scr);
     lv_label_set_text(lblTemp, "25");
-    lv_obj_set_style_text_font(lblTemp, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_font(lblTemp, &lv_font_montserrat_18, 0);
     lv_obj_set_style_text_color(lblTemp, COL_AMBER, 0);
-    lv_obj_set_style_text_align(lblTemp, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(lblTemp, LV_ALIGN_CENTER, 72, -8);
+    lv_obj_set_style_text_align(lblTemp, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_align(lblTemp, LV_ALIGN_BOTTOM_MID, 48, -76);
 
     lblTempUnit = lv_label_create(scr);
     lv_label_set_text(lblTempUnit, "°C");
     lv_obj_set_style_text_font(lblTempUnit, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(lblTempUnit, COL_AMBER, 0);
-    lv_obj_align(lblTempUnit, LV_ALIGN_CENTER, 72, 10);
-
-    lblTempLbl = lv_label_create(scr);
-    lv_label_set_text(lblTempLbl, "TEMP\nBATT.");
-    lv_obj_set_style_text_font(lblTempLbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(lblTempLbl, COL_TEXTDIM, 0);
-    lv_obj_set_style_text_align(lblTempLbl, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(lblTempLbl, LV_ALIGN_CENTER, 72, 30);
+    lv_obj_set_style_text_align(lblTempUnit, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_align(lblTempUnit, LV_ALIGN_BOTTOM_MID, 48, -58);
 
     /* ── SoC (bottom center) ── */
     lblSoc = lv_label_create(scr);
@@ -756,7 +758,7 @@ static void updateDashboard(void) {
         snprintf(buf, sizeof(buf), "%d", (int)canData.rangeKm);
         lv_label_set_text(lblRange, buf);
     }
-    lv_obj_align(lblRange, LV_ALIGN_CENTER, -72, -8);
+    lv_obj_align(lblRange, LV_ALIGN_BOTTOM_MID, -48, -76);
 
     /* Battery temp (coolant inlet temperature — closest to pack average) */
     if (noConnection || !canData.battTempReceived) {
@@ -771,7 +773,7 @@ static void updateDashboard(void) {
         lv_obj_set_style_text_color(lblTemp, COL_WHITE, 0);
         lv_obj_set_style_text_color(lblTempUnit, COL_WHITE, 0);
     }
-    lv_obj_align(lblTemp, LV_ALIGN_CENTER, 72, -8);
+    lv_obj_align(lblTemp, LV_ALIGN_BOTTOM_MID, 48, -76);
 
     /* SoC */
     if (noConnection) {
