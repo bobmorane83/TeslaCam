@@ -127,6 +127,7 @@ typedef struct __attribute__((packed)) {
 #define CAN_ID_VCFRONT_LIGHT 0x3F5
 #define CAN_ID_STALK       0x249
 #define CAN_ID_BRAKE_LIGHT 0x3E2
+#define CAN_ID_BLIND_SPOT  0x399
 #define CAN_ID_HEARTBEAT 0xFFF
 
 #define GEAR_INVALID 0
@@ -161,7 +162,9 @@ static volatile struct {
     bool     leftTurnOn;
     bool     rightTurnOn;
     bool     brakeLightOn;
-} canData = { 0, GEAR_P, 0, false, 0, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0, 0, 0, 0, 0, false, 0.0f, false, 0.0f, false, false, false, false };
+    bool     blindSpotLeft;
+    bool     blindSpotRight;
+} canData = { 0, GEAR_P, 0, false, 0, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0, 0, 0, 0, 0, false, 0.0f, false, 0.0f, false, false, false, false, false, false };
 
 #define BRIDGE_TIMEOUT_MS 10000
 static volatile unsigned long lastBridgeMsg = 0;
@@ -344,6 +347,7 @@ static lv_color_t *brakeCanvasBuf     = NULL;
 static lv_obj_t   *arcBrake           = NULL;
 static bool        brakeVisible        = false;
 static volatile unsigned long lastBrakePedalMsg = 0;
+static volatile unsigned long lastBlindSpotMsg  = 0;
 
 /* LV_IMG_CF_TRUE_COLOR_ALPHA: 3 bytes per pixel (2 color + 1 alpha) */
 #define TURN_CANVAS_BPP  LV_IMG_PX_SIZE_ALPHA_BYTE  // 3 bytes/pixel
@@ -964,19 +968,36 @@ static void updateDashboard(void) {
                         break;
                     case TURN_HAZARD:
                         leftActive = true;  rightActive = true;
-                        leftCol = COL_HALO_AMBER; rightCol = COL_HALO_AMBER;
-                        leftBlinks = false;  rightBlinks = false;  // solid
+                        leftCol = COL_HALO_GREEN; rightCol = COL_HALO_GREEN;
+                        leftBlinks = true;  rightBlinks = true;
                         break;
                     case TURN_LEFT_HAZARD:
-                        leftActive = true;  leftCol = COL_HALO_RED;    leftBlinks = true;
-                        rightActive = true; rightCol = COL_HALO_AMBER; rightBlinks = false;
+                        leftActive = true;  leftCol = COL_HALO_GREEN;   leftBlinks = true;
+                        rightActive = true; rightCol = COL_HALO_GREEN;  rightBlinks = true;
                         break;
                     case TURN_RIGHT_HAZARD:
-                        leftActive = true;  leftCol = COL_HALO_AMBER;  leftBlinks = false;
-                        rightActive = true; rightCol = COL_HALO_RED;    rightBlinks = true;
+                        leftActive = true;  leftCol = COL_HALO_GREEN;   leftBlinks = true;
+                        rightActive = true; rightCol = COL_HALO_GREEN;  rightBlinks = true;
                         break;
                     default: break;
                 }
+            }
+        }
+
+        /* Overlay blind spot warnings (timeout: 600ms) */
+        bool bsActive = (now - lastBlindSpotMsg < 600);
+        if (bsActive && canData.blindSpotLeft) {
+            if (leftActive) {
+                leftCol = COL_HALO_RED;  leftBlinks = true;   // turn + blindspot = RED blink
+            } else {
+                leftActive = true;  leftCol = COL_HALO_AMBER;  leftBlinks = false;  // blindspot only = AMBER fixed
+            }
+        }
+        if (bsActive && canData.blindSpotRight) {
+            if (rightActive) {
+                rightCol = COL_HALO_RED;  rightBlinks = true;
+            } else {
+                rightActive = true;  rightCol = COL_HALO_AMBER;  rightBlinks = false;
             }
         }
 
@@ -1315,6 +1336,17 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
             uint8_t status = m->data[0] & 0x03;
             canData.brakeLightOn = (status == 1);
             lastBrakePedalMsg = millis();
+        }
+        break;
+
+    case CAN_ID_BLIND_SPOT:
+        if (m->dlc >= 1) {
+            /* DAS_blindSpotRearLeft: bit 4, 2 bits — 0=NO_WARNING, 1=LEVEL_1, 2=LEVEL_2, 3=SNA */
+            uint8_t bsLeft  = (m->data[0] >> 4) & 0x03;
+            uint8_t bsRight = (m->data[0] >> 6) & 0x03;
+            canData.blindSpotLeft  = (bsLeft == 1 || bsLeft == 2);
+            canData.blindSpotRight = (bsRight == 1 || bsRight == 2);
+            lastBlindSpotMsg = millis();
         }
         break;
 #endif // FEATURE_TURN_SIGNAL
