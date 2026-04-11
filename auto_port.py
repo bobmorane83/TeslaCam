@@ -16,4 +16,9 @@ if target_mac:
             print(f"[AUTO_PORT] {target_mac} -> {port.device}")
             break
     else:
-        print(f"[AUTO_PORT] Warning: MAC {target_mac} not found — using default port")
+        import sys
+        print(f"[AUTO_PORT] ERROR: MAC {target_mac} not found — aborting to prevent cross-flash!")
+        print(f"[AUTO_PORT] Available ports:")
+        for p in serial.tools.list_ports.comports():
+            print(f"  {p.device}  hwid={p.hwid}")
+        sys.exit(1)
