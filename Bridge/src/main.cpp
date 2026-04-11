@@ -55,7 +55,6 @@
 // ───────────────────────────────────────────────────────────────────────────
 // TIMING & BUFFERS
 // ───────────────────────────────────────────────────────────────────────────
-#define CAN_RX_INTERVAL   1     // Check CAN bus every 1ms (fast polling)
 #define STATS_INTERVAL    10000 // Print stats every 10s
 #define DEBUG_LEVEL       2     // 1=ERROR, 2=INFO, 3=DEBUG
 #define HEARTBEAT_INTERVAL_MS 1000 // Send heartbeat every 1s via ESP-NOW
@@ -65,6 +64,18 @@
 // ESP-NOW RATE LIMITING — prevent frequent CAN IDs from saturating channel
 // ───────────────────────────────────────────────────────────────────────────
 #define ESPNOW_MIN_INTERVAL_MS 200  // Max 5 msg/s per CAN ID via ESP-NOW
+
+// ───────────────────────────────────────────────────────────────────────────
+// DUAL-CORE TASK CONFIGURATION
+// Core 1 (APP_CPU): Dedicated CAN RX polling (MCP2515 + TWAI)
+// Core 0 (PRO_CPU): ESP-NOW TX + WiFi stack
+// Pipeline: CAN → Queue → Rate limit → ESP-NOW broadcast
+// ───────────────────────────────────────────────────────────────────────────
+#define CAN_QUEUE_SIZE       256   // Inter-core message queue depth
+#define CAN_RX_TASK_STACK    4096  // Stack size for CAN RX task
+#define CAN_RX_TASK_PRIO     5     // High priority (dedicated CAN polling)
+#define ESPNOW_TX_TASK_STACK 4096  // Stack size for ESP-NOW TX task
+#define ESPNOW_TX_TASK_PRIO  3     // Medium priority (shares Core 0 with WiFi)
 
 // ───────────────────────────────────────────────────────────────────────────
 // DATA STRUCTURES
@@ -85,9 +96,12 @@ typedef struct __attribute__((packed)) {
 
 MCP_CAN CAN(MCP_CS_PIN);
 
-volatile bool can_message_ready = false;
-unsigned long last_can_check = 0;
 unsigned long last_stats_print = 0;
+
+// FreeRTOS inter-core pipeline
+QueueHandle_t can_queue = NULL;
+TaskHandle_t canRxTaskHandle = NULL;
+TaskHandle_t espnowTxTaskHandle = NULL;
 
 // ESP-NOW per-ID rate limiting (2048 × 4 bytes = 8 KB)
 static unsigned long espnow_last_sent[2048] = {0};
@@ -101,6 +115,8 @@ unsigned long stats_mcp_rx = 0;       // MCP2515 (VehicleBus) frames received
 unsigned long stats_twai_rx = 0;      // TWAI (ChassisBus) frames received
 unsigned long stats_espnow_tx = 0;
 unsigned long stats_errors = 0;
+unsigned long stats_queue_full = 0;     // Queue overflow (frames lost)
+unsigned long stats_rate_limited = 0;   // Frames skipped by rate limiter
 bool twai_running = false;            // TWAI driver state
 
 bool espnow_active = false;      // true = ESP_NOW broadcasting
@@ -122,12 +138,14 @@ void initializeWiFiForESPNOW(void);
 void initializeESPNOW(void);
 void checkCANBus(void);
 void checkTWAIBus(void);
-void handleCANMessage(uint32_t id, uint8_t dlc, uint8_t* data);
+void queueCANMessage(uint32_t id, uint8_t dlc, uint8_t* data);
 void transmitViaESPNOW(ESP_CAN_Message_t* msg);
 void sendHeartbeat(void);
 void printStatistics(void);
 void onESPNOWSend(const uint8_t* mac_addr, esp_now_send_status_t status);
 void onESPNOWReceive(const esp_now_recv_info_t *recv_info, const uint8_t* data, int data_len);
+void canRxTask(void* param);
+void espnowTxTask(void* param);
 
 // =============================================================================
 // SETUP
@@ -137,55 +155,55 @@ void setup() {
     delay(500);
 
     Serial.println("\n\n========================================");
-    Serial.println("  ESP32-S3 CAN-to-ESP_NOW Bridge v4.3");
+    Serial.println("  ESP32-S3 CAN-to-ESP_NOW Bridge v5.0");
     Serial.println("  Tesla Model 3 Bridge");
     Serial.println("  LilyGo T-2CAN (MCP2515 + TWAI)");
+    Serial.println("  Dual-core: CAN RX + ESP-NOW TX");
     Serial.println("========================================");
     Serial.print("Board: ");
     Serial.println(ARDUINO_BOARD);
     Serial.println("========================================\n");
 
-    // Init subsystems in order
+    // Create inter-core CAN message queue
+    can_queue = xQueueCreate(CAN_QUEUE_SIZE, sizeof(ESP_CAN_Message_t));
+    if (!can_queue) {
+        LOG_ERROR("Failed to create CAN queue!");
+        while(1) delay(1000);
+    }
+    Serial.printf("[QUEUE] Created (%d slots, %d bytes/msg)\n",
+                  CAN_QUEUE_SIZE, sizeof(ESP_CAN_Message_t));
+
+    // Init subsystems
     initializeCAN();
     initializeTWAI();
     initializeWiFiForESPNOW();
     initializeESPNOW();
     espnow_active = true;
 
+    // Create CAN RX task on Core 1 (APP_CPU) — dedicated CAN polling
+    xTaskCreatePinnedToCore(canRxTask, "CAN_RX",
+        CAN_RX_TASK_STACK, NULL, CAN_RX_TASK_PRIO, &canRxTaskHandle, 1);
+    Serial.println("[TASK] CAN_RX pinned to Core 1 (APP_CPU)");
+
+    // Create ESP-NOW TX task on Core 0 (PRO_CPU) — shares with WiFi stack
+    xTaskCreatePinnedToCore(espnowTxTask, "ESPNOW_TX",
+        ESPNOW_TX_TASK_STACK, NULL, ESPNOW_TX_TASK_PRIO, &espnowTxTaskHandle, 0);
+    Serial.println("[TASK] ESPNOW_TX pinned to Core 0 (PRO_CPU)");
+
     Serial.println("\n========================================");
-    Serial.println("  READY");
-    Serial.println("  Mode: CAN RX -> ESP-NOW broadcast");
-    Serial.println("  WiFi: STA (ESP-NOW only)");
+    Serial.println("  READY — DUAL-CORE MODE");
+    Serial.println("  Core 1: CAN RX polling (MCP2515 + TWAI)");
+    Serial.println("  Core 0: ESP-NOW TX + WiFi");
+    Serial.println("  Pipeline: CAN → Queue → Rate limit → ESP-NOW");
     Serial.println("========================================\n");
 }
 
 // =============================================================================
-// MAIN LOOP
+// MAIN LOOP (low priority — stats only, CAN/ESP-NOW handled by tasks)
 // =============================================================================
 void loop() {
-    unsigned long current_time = millis();
-
-    // Check CAN bus for messages (every 1ms — fast polling)
-    if (current_time - last_can_check >= CAN_RX_INTERVAL) {
-        last_can_check = current_time;
-        checkCANBus();
-        checkTWAIBus();
-    }
-
-    // Send ESP-NOW heartbeat periodically
-    if (espnow_active && (current_time - last_heartbeat >= HEARTBEAT_INTERVAL_MS)) {
-        last_heartbeat = current_time;
-        sendHeartbeat();
-    }
-
-    // Print statistics periodically
-    if (current_time - last_stats_print >= STATS_INTERVAL) {
-        last_stats_print = current_time;
-        printStatistics();
-    }
-
-    // Yield to avoid watchdog and let WiFi task run
-    yield();
+    vTaskDelay(pdMS_TO_TICKS(STATS_INTERVAL));
+    printStatistics();
 }
 
 // =============================================================================
@@ -243,31 +261,26 @@ void initializeCAN(void) {
 }
 
 void checkCANBus(void) {
-    if (CAN.checkReceive() != CAN_MSGAVAIL) return;
+    // Drain ALL available MCP2515 messages (2 HW RX buffers)
+    while (CAN.checkReceive() == CAN_MSGAVAIL) {
+        unsigned long can_id = 0;
+        byte dlc = 0;
+        // Buffer de 16 octets (pas 8) car la lib mcp_can copie
+        // m_nDlc octets et le DLC du MCP2515 peut aller jusqu'à 15 (4 bits).
+        byte data[16] = {0};
 
-    unsigned long can_id = 0;
-    byte dlc = 0;
-    // IMPORTANT: buffer de 16 octets (pas 8) car la lib mcp_can copie
-    // m_nDlc octets et le DLC du MCP2515 peut aller jusqu'à 15 (4 bits).
-    // Avec un buffer de 8 et du bruit sur le bus, c'est un stack overflow.
-    byte data[16] = {0};
-
-    byte result = CAN.readMsgBuf(&can_id, &dlc, data);
-    if (result == CAN_OK) {
-        // Clamp DLC to CAN 2.0 max (8 bytes)
-        if (dlc > 8) dlc = 8;
-
-        stats_mcp_rx++;
-
-        // Compact log (only every 100th message at DEBUG_LEVEL 2)
-        if (DEBUG_LEVEL >= 3 || (stats_mcp_rx % 100 == 0)) {
-            Serial.printf("[MCP] #%lu ID:0x%03lX DLC:%d\n",
-                stats_mcp_rx, can_id, dlc);
+        byte result = CAN.readMsgBuf(&can_id, &dlc, data);
+        if (result == CAN_OK) {
+            if (dlc > 8) dlc = 8;
+            stats_mcp_rx++;
+            if (DEBUG_LEVEL >= 3) {
+                Serial.printf("[MCP] #%lu ID:0x%03lX DLC:%d\n",
+                    stats_mcp_rx, can_id, dlc);
+            }
+            queueCANMessage(can_id, dlc, data);
+        } else {
+            stats_errors++;
         }
-
-        handleCANMessage(can_id, dlc, data);
-    } else {
-        stats_errors++;
     }
 }
 
@@ -280,7 +293,7 @@ void initializeTWAI(void) {
 
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
         (gpio_num_t)TWAI_TX_PIN, (gpio_num_t)TWAI_RX_PIN, TWAI_MODE_LISTEN_ONLY);
-    g_config.rx_queue_len = 32;  // Deeper RX queue for burst traffic
+    g_config.rx_queue_len = 64;  // Deep RX queue for burst traffic
 
     twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
     twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
@@ -316,12 +329,12 @@ void checkTWAIBus(void) {
         if (dlc > 8) dlc = 8;
 
         stats_twai_rx++;
-        if (DEBUG_LEVEL >= 3 || (stats_twai_rx % 100 == 0)) {
+        if (DEBUG_LEVEL >= 3) {
             Serial.printf("[TWAI] #%lu ID:0x%03lX DLC:%d\n",
                 stats_twai_rx, (unsigned long)rx_msg.identifier, dlc);
         }
 
-        handleCANMessage(rx_msg.identifier, dlc, rx_msg.data);
+        queueCANMessage(rx_msg.identifier, dlc, rx_msg.data);
     }
 }
 
@@ -344,7 +357,7 @@ bool isValidCanId(uint32_t id) {
         || bsearch16(CHASSIS_BUS_IDS, CHASSIS_BUS_IDS_COUNT, id16);
 }
 
-void handleCANMessage(uint32_t id, uint8_t dlc, uint8_t* data) {
+void queueCANMessage(uint32_t id, uint8_t dlc, uint8_t* data) {
     // FILTER: Only process valid Tesla CAN IDs
     if (!isValidCanId(id)) {
         stats_errors++;
@@ -359,15 +372,9 @@ void handleCANMessage(uint32_t id, uint8_t dlc, uint8_t* data) {
     memcpy(msg.data, data, dlc);
     if (dlc < 8) memset(msg.data + dlc, 0, 8 - dlc);
 
-    // ESP-NOW rate limiting: max 1 per ESPNOW_MIN_INTERVAL_MS per CAN ID
-    // Priority IDs bypass rate limiting entirely
-    uint16_t idx = id & 0x7FF;
-    bool priority = (id == 0x257 || id == 0x266 || id == 0x2E5 || id == 0x33A ||
-                     id == 0x292 ||
-                     id == TURN_CAN_ID_UI || id == TURN_CAN_ID_3F5 || id == 0x249);
-    if (priority || msg.timestamp - espnow_last_sent[idx] >= ESPNOW_MIN_INTERVAL_MS) {
-        espnow_last_sent[idx] = msg.timestamp;
-        transmitViaESPNOW(&msg);
+    // Push to inter-core queue (non-blocking)
+    if (xQueueSend(can_queue, &msg, 0) != pdTRUE) {
+        stats_queue_full++;  // Queue full — frame lost
     }
 }
 
@@ -466,19 +473,76 @@ void onESPNOWReceive(const esp_now_recv_info_t *recv_info, const uint8_t* data, 
 }
 
 // =============================================================================
+// DUAL-CORE TASKS
+// =============================================================================
+
+// CAN RX Task — Core 1 (APP_CPU): Dedicated polling of MCP2515 + TWAI
+// Drains all available CAN messages and pushes them to the inter-core queue.
+// Priority 5 ensures CAN polling is never delayed by other tasks on Core 1.
+void canRxTask(void* param) {
+    Serial.println("[CAN_RX] Task started on Core 1");
+    while (1) {
+        checkCANBus();   // Drain MCP2515 (SPI, 2 HW buffers)
+        checkTWAIBus();  // Drain TWAI (ESP32-S3 built-in, 64-deep queue)
+        vTaskDelay(1);   // 1 tick yield — WDT safe, ~1000 polls/s
+    }
+}
+
+// ESP-NOW TX Task — Core 0 (PRO_CPU): Dequeues CAN messages and broadcasts
+// Rate limiting is applied here to avoid saturating the WiFi channel.
+// Heartbeat is also sent from this task (same core as WiFi stack).
+void espnowTxTask(void* param) {
+    Serial.println("[ESPNOW_TX] Task started on Core 0");
+    ESP_CAN_Message_t msg;
+
+    while (1) {
+        // Block on queue with 100ms timeout (for heartbeat scheduling)
+        if (xQueueReceive(can_queue, &msg, pdMS_TO_TICKS(100)) == pdTRUE) {
+            // Rate limiting: max 1 per ESPNOW_MIN_INTERVAL_MS per CAN ID
+            // Priority IDs bypass rate limiting entirely
+            uint16_t idx = msg.can_id & 0x7FF;
+            bool priority = (msg.can_id == 0x257 || msg.can_id == 0x266 ||
+                             msg.can_id == 0x2E5 || msg.can_id == 0x33A ||
+                             msg.can_id == 0x292 ||
+                             msg.can_id == TURN_CAN_ID_UI ||
+                             msg.can_id == TURN_CAN_ID_3F5 ||
+                             msg.can_id == 0x249);
+
+            unsigned long now = millis();
+            if (priority || now - espnow_last_sent[idx] >= ESPNOW_MIN_INTERVAL_MS) {
+                espnow_last_sent[idx] = now;
+                transmitViaESPNOW(&msg);
+            } else {
+                stats_rate_limited++;
+            }
+        }
+
+        // Heartbeat (sent from Core 0, same as WiFi stack)
+        unsigned long now = millis();
+        if (espnow_active && (now - last_heartbeat >= HEARTBEAT_INTERVAL_MS)) {
+            last_heartbeat = now;
+            sendHeartbeat();
+        }
+    }
+}
+
+// =============================================================================
 // STATISTICS
 // =============================================================================
 
 void printStatistics(void) {
-    Serial.println("\n--- Stats ---");
-    Serial.printf("  Mode:         ESP_NOW only\n");
+    Serial.println("\n--- Stats (dual-core) ---");
     Serial.printf("  MCP RX:       %lu (VehicleBus)\n", stats_mcp_rx);
     Serial.printf("  TWAI RX:      %lu (ChassisBus)\n", stats_twai_rx);
     Serial.printf("  ESP_NOW TX:   %lu\n", stats_espnow_tx);
+    Serial.printf("  Rate limited: %lu\n", stats_rate_limited);
+    Serial.printf("  Queue full:   %lu\n", stats_queue_full);
+    Serial.printf("  Queue depth:  %u/%d\n",
+                  uxQueueMessagesWaiting(can_queue), CAN_QUEUE_SIZE);
     Serial.printf("  Errors:       %lu\n", stats_errors);
     Serial.printf("  Free heap:    %lu\n", ESP.getFreeHeap());
     Serial.printf("  Uptime:       %lu s\n", millis() / 1000);
-    Serial.println("-------------\n");
+    Serial.println("-------------------------\n");
 }
 
 // =============================================================================
