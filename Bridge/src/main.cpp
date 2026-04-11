@@ -3,14 +3,13 @@
 #include <SPI.h>
 #include <esp_now.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
 #include <esp_wifi.h>
 #include <driver/twai.h>
 #include "valid_can_ids.h"  // Whitelist: VehicleBus + ChassisBus IDs
 
 // =============================================================================
-// ESP32-S3 CAN-to-WiFi Hub (Tesla Model 3)
-// Purpose: Bridge CAN bus to ESP32 devices via ESP_NOW + WiFi AP UDP stream
+// ESP32-S3 CAN-to-ESP_NOW Bridge (Tesla Model 3)
+// Purpose: Bridge CAN bus to ESP32 devices via ESP_NOW broadcast
 // Target: LilyGo T-2CAN (ESP32-S3, MCP2515)
 // =============================================================================
 
@@ -37,34 +36,16 @@
 #define CAN_CRYSTAL       MCP_16MHZ      // 16 MHz crystal (LilyGo T-2CAN)
 
 // ───────────────────────────────────────────────────────────────────────────
-// WiFi ACCESS POINT CONFIGURATION
+// WiFi CONFIGURATION (STA mode for ESP-NOW only)
 // ───────────────────────────────────────────────────────────────────────────
-#define AP_SSID           "bridge"
-#define AP_PASSWORD       "teslamodel3"
-#define AP_CHANNEL        1      // WiFi channel (must match Camera + Display)
-#define AP_MAX_CLIENTS    4
-#define AP_BEACON_MS      100    // Beacon interval (default 100ms)
+#define WIFI_CHANNEL      1      // WiFi channel (must match Camera + Display)
 #define WIFI_TX_POWER     78     // 19.5 dBm (max). Value = dBm * 4
-
-// ───────────────────────────────────────────────────────────────────────────
-// UDP BROADCAST CONFIGURATION
-// ───────────────────────────────────────────────────────────────────────────
-#define UDP_PORT          5556
-#define UDP_BROADCAST_IP  IPAddress(192, 168, 4, 255)  // Broadcast on AP subnet
 
 // ───────────────────────────────────────────────────────────────────────────
 // ESP_NOW CONFIGURATION
 // ───────────────────────────────────────────────────────────────────────────
 #define ESPNOW_CHANNEL    0      // 0 = use current WiFi channel
 #define MAX_PEERS         3
-#define ESPNOW_ENABLED_INIT false  // ESP_NOW off at boot (WiFi AP mode)
-
-// ───────────────────────────────────────────────────────────────────────────
-// AP AUTO-SHUTDOWN CONFIGURATION
-// If no WiFi client connects within this delay after boot,
-// the AP is permanently shut down and ESP_NOW takes over.
-// ───────────────────────────────────────────────────────────────────────────
-#define AP_TIMEOUT_MS     180000  // 3 minutes (180 000 ms)
 
 // ───────────────────────────────────────────────────────────────────────────
 // LED FEEDBACK CONFIGURATION
@@ -86,35 +67,10 @@
 #define ESPNOW_MIN_INTERVAL_MS 200  // Max 5 msg/s per CAN ID via ESP-NOW
 
 // ───────────────────────────────────────────────────────────────────────────
-// UDP BATCHING — critical for WiFi stability
-// Instead of 1 UDP packet per CAN frame (1000+/s = WiFi death),
-// we buffer frames and flush every UDP_FLUSH_INTERVAL_MS.
-// Max batch: ~1400 bytes / 18 bytes per frame = 77 frames per UDP packet.
-// ───────────────────────────────────────────────────────────────────────────
-#define UDP_FLUSH_INTERVAL_MS   20    // Flush every 20ms (50 UDP packets/s max)
-#define UDP_BUFFER_MAX_FRAMES   60    // Max frames per batch (60 * 18 = 1080 bytes)
-#define UDP_BUFFER_SIZE         (UDP_BUFFER_MAX_FRAMES * 18)  // 1080 bytes
-
-// ───────────────────────────────────────────────────────────────────────────
-// UDP PACKET FORMAT (18 bytes per CAN frame)
-// ───────────────────────────────────────────────────────────────────────────
-// Byte 0:     Magic byte 0xCA
-// Byte 1:     Magic byte 0x4E ("CAN" marker)
-// Byte 2-5:   CAN ID (uint32_t, little-endian)
-// Byte 6:     DLC (0-8)
-// Byte 7:     Flags (bit0: is_extended)
-// Byte 8-15:  Data bytes (8 bytes, zero-padded)
-// Byte 16-17: Sequence number (uint16_t, little-endian)
-// ───────────────────────────────────────────────────────────────────────────
-#define UDP_PACKET_SIZE   18
-#define UDP_MAGIC_0       0xCA
-#define UDP_MAGIC_1       0x4E
-
-// ───────────────────────────────────────────────────────────────────────────
 // DATA STRUCTURES
 // ───────────────────────────────────────────────────────────────────────────
 
-// CAN message payload (shared between ESP_NOW and UDP)
+// CAN message payload for ESP_NOW broadcast
 typedef struct __attribute__((packed)) {
     uint32_t can_id;        // CAN ID (11-bit or 29-bit)
     uint8_t  dlc;           // Data Length Code (0-8)
@@ -128,7 +84,6 @@ typedef struct __attribute__((packed)) {
 // ───────────────────────────────────────────────────────────────────────────
 
 MCP_CAN CAN(MCP_CS_PIN);
-WiFiUDP udp;
 
 volatile bool can_message_ready = false;
 unsigned long last_can_check = 0;
@@ -145,26 +100,10 @@ static unsigned long espnow_last_sent[2048] = {0};
 unsigned long stats_mcp_rx = 0;       // MCP2515 (VehicleBus) frames received
 unsigned long stats_twai_rx = 0;      // TWAI (ChassisBus) frames received
 unsigned long stats_espnow_tx = 0;
-unsigned long stats_udp_tx = 0;
-unsigned long stats_udp_packets = 0;  // Actual UDP packets sent (batches)
-unsigned long stats_udp_skip = 0;
 unsigned long stats_errors = 0;
 bool twai_running = false;            // TWAI driver state
-uint16_t udp_sequence = 0;
-uint8_t  ap_clients_count = 0;
-unsigned long last_client_check = 0;
-#define CLIENT_CHECK_INTERVAL 2000
 
-// AP auto-shutdown state
-bool ap_active = true;           // true = WiFi AP running, false = AP shut down
 bool espnow_active = false;      // true = ESP_NOW broadcasting
-unsigned long ap_no_client_since = 0;  // millis() when last client disconnected (0 = boot)
-
-// UDP batch buffer
-uint8_t  udp_buffer[UDP_BUFFER_SIZE];
-uint16_t udp_buffer_offset = 0;       // Current write position in buffer
-uint8_t  udp_buffer_count = 0;        // Number of frames in buffer
-unsigned long last_udp_flush = 0;     // Last flush timestamp
 unsigned long last_heartbeat = 0;     // Last heartbeat send timestamp
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -179,21 +118,16 @@ unsigned long last_heartbeat = 0;     // Last heartbeat send timestamp
 // ───────────────────────────────────────────────────────────────────────────
 void initializeCAN(void);
 void initializeTWAI(void);
-void initializeWiFiAP(void);
+void initializeWiFiForESPNOW(void);
 void initializeESPNOW(void);
-void initializeUDP(void);
 void checkCANBus(void);
 void checkTWAIBus(void);
 void handleCANMessage(uint32_t id, uint8_t dlc, uint8_t* data);
 void transmitViaESPNOW(ESP_CAN_Message_t* msg);
 void sendHeartbeat(void);
-void bufferForUDP(ESP_CAN_Message_t* msg);
-void flushUDPBuffer(void);
 void printStatistics(void);
 void onESPNOWSend(const uint8_t* mac_addr, esp_now_send_status_t status);
 void onESPNOWReceive(const esp_now_recv_info_t *recv_info, const uint8_t* data, int data_len);
-void shutdownAPAndStartESPNOW(void);
-void onWiFiEvent(WiFiEvent_t event);
 
 // =============================================================================
 // SETUP
@@ -203,7 +137,7 @@ void setup() {
     delay(500);
 
     Serial.println("\n\n========================================");
-    Serial.println("  ESP32-S3 CAN-to-WiFi Hub v4.1");
+    Serial.println("  ESP32-S3 CAN-to-ESP_NOW Bridge v4.3");
     Serial.println("  Tesla Model 3 Bridge");
     Serial.println("  LilyGo T-2CAN (MCP2515 + TWAI)");
     Serial.println("========================================");
@@ -214,22 +148,14 @@ void setup() {
     // Init subsystems in order
     initializeCAN();
     initializeTWAI();
-    initializeWiFiAP();
+    initializeWiFiForESPNOW();
     initializeESPNOW();
     espnow_active = true;
-    Serial.printf("[AP] Auto-shutdown dans %d s si aucun client\n", AP_TIMEOUT_MS / 1000);
-    initializeUDP();
 
     Serial.println("\n========================================");
     Serial.println("  READY");
-    Serial.println("  CAN RX -> Batched UDP TX");
-    Serial.printf("  Flush interval: %d ms\n", UDP_FLUSH_INTERVAL_MS);
-    Serial.print("  WiFi AP: ");
-    Serial.print(AP_SSID);
-    Serial.print(" @ ");
-    Serial.println(WiFi.softAPIP());
-    Serial.print("  UDP Port: ");
-    Serial.println(UDP_PORT);
+    Serial.println("  Mode: CAN RX -> ESP-NOW broadcast");
+    Serial.println("  WiFi: STA (ESP-NOW only)");
     Serial.println("========================================\n");
 }
 
@@ -252,34 +178,8 @@ void loop() {
         sendHeartbeat();
     }
 
-    // ── AP auto-shutdown logic ──────────────────────────────────────────
-    // If AP is active and no client connected for AP_TIMEOUT_MS,
-    // shut down AP and switch to ESP_NOW-only mode.
-    // This triggers both at boot (no client ever) and after last client leaves.
-    if (ap_active && ap_clients_count == 0 &&
-        (current_time - ap_no_client_since >= AP_TIMEOUT_MS)) {
-        shutdownAPAndStartESPNOW();
-    }
-
-    // Flush UDP buffer periodically (only when AP is active)
-    if (ap_active && (current_time - last_udp_flush >= UDP_FLUSH_INTERVAL_MS)) {
-        last_udp_flush = current_time;
-        flushUDPBuffer();
-    }
-
-    // Periodically refresh client count (only when AP is active)
-    if (ap_active && (current_time - last_client_check >= CLIENT_CHECK_INTERVAL)) {
-        last_client_check = current_time;
-        uint8_t prev_count = ap_clients_count;
-        ap_clients_count = WiFi.softAPgetStationNum();
-        // While clients are connected, keep resetting the no-client timer
-        if (ap_clients_count > 0) {
-            ap_no_client_since = current_time;
-        }
-    }
-
-    // Print statistics periodically (only when AP is active)
-    if (ap_active && (current_time - last_stats_print >= STATS_INTERVAL)) {
+    // Print statistics periodically
+    if (current_time - last_stats_print >= STATS_INTERVAL) {
         last_stats_print = current_time;
         printStatistics();
     }
@@ -357,20 +257,17 @@ void checkCANBus(void) {
         // Clamp DLC to CAN 2.0 max (8 bytes)
         if (dlc > 8) dlc = 8;
 
-        // Stats & logging only when AP is active (save CPU in ESP_NOW-only mode)
-        if (ap_active) {
-            stats_mcp_rx++;
+        stats_mcp_rx++;
 
-            // Compact log (only every 100th message at DEBUG_LEVEL 2)
-            if (DEBUG_LEVEL >= 3 || (stats_mcp_rx % 100 == 0)) {
-                Serial.printf("[MCP] #%lu ID:0x%03lX DLC:%d\n",
-                    stats_mcp_rx, can_id, dlc);
-            }
+        // Compact log (only every 100th message at DEBUG_LEVEL 2)
+        if (DEBUG_LEVEL >= 3 || (stats_mcp_rx % 100 == 0)) {
+            Serial.printf("[MCP] #%lu ID:0x%03lX DLC:%d\n",
+                stats_mcp_rx, can_id, dlc);
         }
 
         handleCANMessage(can_id, dlc, data);
     } else {
-        if (ap_active) stats_errors++;
+        stats_errors++;
     }
 }
 
@@ -418,12 +315,10 @@ void checkTWAIBus(void) {
         uint8_t dlc = rx_msg.data_length_code;
         if (dlc > 8) dlc = 8;
 
-        if (ap_active) {
-            stats_twai_rx++;
-            if (DEBUG_LEVEL >= 3 || (stats_twai_rx % 100 == 0)) {
-                Serial.printf("[TWAI] #%lu ID:0x%03lX DLC:%d\n",
-                    stats_twai_rx, (unsigned long)rx_msg.identifier, dlc);
-            }
+        stats_twai_rx++;
+        if (DEBUG_LEVEL >= 3 || (stats_twai_rx % 100 == 0)) {
+            Serial.printf("[TWAI] #%lu ID:0x%03lX DLC:%d\n",
+                stats_twai_rx, (unsigned long)rx_msg.identifier, dlc);
         }
 
         handleCANMessage(rx_msg.identifier, dlc, rx_msg.data);
@@ -452,7 +347,7 @@ bool isValidCanId(uint32_t id) {
 void handleCANMessage(uint32_t id, uint8_t dlc, uint8_t* data) {
     // FILTER: Only process valid Tesla CAN IDs
     if (!isValidCanId(id)) {
-        if (ap_active) stats_errors++;  // Count as invalid (only in AP mode)
+        stats_errors++;
         return;
     }
 
@@ -474,157 +369,29 @@ void handleCANMessage(uint32_t id, uint8_t dlc, uint8_t* data) {
         espnow_last_sent[idx] = msg.timestamp;
         transmitViaESPNOW(&msg);
     }
-
-    bufferForUDP(&msg);
 }
 
 // =============================================================================
-// WiFi ACCESS POINT (AP+STA mode for ESP_NOW compatibility)
+// WiFi STA (for ESP-NOW only, no Access Point)
 // =============================================================================
 
-void onWiFiEvent(WiFiEvent_t event) {
-    // IMPORTANT: Ne PAS appeler WiFi.softAPgetStationNum() ici !
-    // Les callbacks WiFi doivent être ultra-légers.
-    // Le comptage des clients se fait dans loop() via polling.
-    switch (event) {
-        case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
-            Serial.println("[WiFi] Client connecté");
-            break;
-        case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
-            Serial.println("[WiFi] Client déconnecté");
-            // Reset the no-client timer — timeout restarts from now
-            ap_no_client_since = millis();
-            break;
-        default:
-            break;
-    }
-}
+void initializeWiFiForESPNOW(void) {
+    Serial.println("[WiFi] Initializing STA mode for ESP-NOW...");
 
-void initializeWiFiAP(void) {
-    Serial.println("[WiFi] Initializing...");
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(100);
 
-    // 1. Register event handler (léger, pas de WiFi API dedans)
-    WiFi.onEvent(onWiFiEvent);
-
-    // 2. Set mode — AP only (pas de STA scan en arrière-plan)
-    WiFi.mode(WIFI_AP);
-    Serial.println("[WiFi] Mode: AP seul");
-
-    // 3. Config IP explicite AVANT softAP pour DHCP prévisible
-    IPAddress local_IP(192, 168, 4, 1);
-    IPAddress gateway(192, 168, 4, 1);
-    IPAddress subnet(255, 255, 255, 0);
-    WiFi.softAPConfig(local_IP, gateway, subnet);
-
-    // 4. Démarrer l'AP — ceci appelle esp_wifi_start() en interne
-    bool ap_ok = WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL, 0, AP_MAX_CLIENTS);
-    if (!ap_ok) {
-        Serial.println("[WiFi] ERREUR: softAP a échoué !");
-        return;
-    }
-    delay(500);  // Attendre stabilisation complète de l'AP
-
-    // 5. APRÈS softAP : désactiver power save
-    //    CRITIQUE: esp_wifi_set_ps() DOIT être appelé APRÈS esp_wifi_start()
-    //    Sinon l'appel échoue silencieusement et le power save reste actif !
     WiFi.setSleep(false);
-    Serial.println("[WiFi] Power save: OFF (post-start)");
+    Serial.println("[WiFi] Power save: OFF");
 
-    // 6. APRÈS softAP : régler la puissance TX max
+    esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_max_tx_power(WIFI_TX_POWER);
-    Serial.printf("[WiFi] TX power: %.1f dBm\n", WIFI_TX_POWER / 4.0);
 
-    // NE PAS appeler esp_wifi_set_protocol() ni esp_wifi_set_bandwidth()
-    // après softAP — les défauts (11b/g/n, HT20 en AP seul) sont déjà optimaux.
-    // Ces appels post-start forcent une reconfiguration radio qui déconnecte les clients.
-
-    Serial.print("[WiFi] AP SSID: ");
-    Serial.println(AP_SSID);
-    Serial.print("[WiFi] AP IP: ");
-    Serial.println(WiFi.softAPIP());
-    Serial.print("[WiFi] AP MAC: ");
-    Serial.println(WiFi.softAPmacAddress());
-    Serial.printf("[WiFi] AP Channel: %d, Max clients: %d\n",
-                  AP_CHANNEL, AP_MAX_CLIENTS);
-}
-
-// =============================================================================
-// UDP BROADCAST
-// =============================================================================
-
-void initializeUDP(void) {
-    Serial.println("[UDP] Initializing batched mode...");
-    udp.begin(UDP_PORT);
-    memset(udp_buffer, 0, sizeof(udp_buffer));
-    udp_buffer_offset = 0;
-    udp_buffer_count = 0;
-    Serial.printf("[UDP] Port %d, batch every %d ms, max %d frames/batch\n",
-                  UDP_PORT, UDP_FLUSH_INTERVAL_MS, UDP_BUFFER_MAX_FRAMES);
-    Serial.printf("[UDP] Broadcast IP: %s\n", UDP_BROADCAST_IP.toString().c_str());
-}
-
-void bufferForUDP(ESP_CAN_Message_t* msg) {
-    // Skip UDP buffering entirely when AP is shut down
-    if (!ap_active) return;
-
-    // Add a CAN frame to the UDP send buffer (18 bytes per frame)
-    // Will be flushed as a single UDP packet from the main loop
-    if (udp_buffer_count >= UDP_BUFFER_MAX_FRAMES) {
-        // Buffer full — force flush now
-        flushUDPBuffer();
-    }
-
-    uint8_t* p = &udp_buffer[udp_buffer_offset];
-
-    // Magic bytes
-    p[0] = UDP_MAGIC_0;
-    p[1] = UDP_MAGIC_1;
-
-    // CAN ID (little-endian)
-    p[2] = (msg->can_id) & 0xFF;
-    p[3] = (msg->can_id >> 8) & 0xFF;
-    p[4] = (msg->can_id >> 16) & 0xFF;
-    p[5] = (msg->can_id >> 24) & 0xFF;
-
-    // DLC + flags
-    p[6] = msg->dlc;
-    p[7] = msg->is_extended;
-
-    // Data bytes
-    memcpy(&p[8], msg->data, 8);
-
-    // Sequence number (little-endian)
-    p[16] = udp_sequence & 0xFF;
-    p[17] = (udp_sequence >> 8) & 0xFF;
-    udp_sequence++;
-
-    udp_buffer_offset += UDP_PACKET_SIZE;
-    udp_buffer_count++;
-    stats_udp_tx++;  // Count individual frames buffered
-}
-
-void flushUDPBuffer(void) {
-    // Send all buffered frames as a single UDP packet
-    if (udp_buffer_count == 0) return;
-
-    // Skip if no clients connected
-    if (ap_clients_count == 0) {
-        stats_udp_skip += udp_buffer_count;
-        udp_buffer_offset = 0;
-        udp_buffer_count = 0;
-        return;
-    }
-
-    // Send one big UDP packet containing all buffered frames
-    udp.beginPacket(UDP_BROADCAST_IP, UDP_PORT);
-    udp.write(udp_buffer, udp_buffer_offset);
-    if (udp.endPacket()) {
-        stats_udp_packets++;
-    }
-
-    // Reset buffer
-    udp_buffer_offset = 0;
-    udp_buffer_count = 0;
+    Serial.printf("[WiFi] STA mode ready (channel %d, TX %.1f dBm)\n",
+                  WIFI_CHANNEL, WIFI_TX_POWER / 4.0);
+    Serial.print("[WiFi] STA MAC: ");
+    Serial.println(WiFi.macAddress());
 }
 
 // =============================================================================
@@ -642,20 +409,13 @@ void initializeESPNOW(void) {
     esp_now_register_send_cb(onESPNOWSend);
     esp_now_register_recv_cb(onESPNOWReceive);
 
-    // Broadcast peer — use AP_CHANNEL explicitly for consistency
+    // Broadcast peer — use WIFI_CHANNEL explicitly for consistency
     esp_now_peer_info_t peer_info = {};
     memset(&peer_info, 0, sizeof(peer_info));
-    peer_info.channel = AP_CHANNEL;
+    peer_info.channel = WIFI_CHANNEL;
     peer_info.encrypt = false;
     memset(peer_info.peer_addr, 0xFF, 6);
-
-    // Set correct interface based on current WiFi mode
-    wifi_mode_t mode;
-    esp_wifi_get_mode(&mode);
-    peer_info.ifidx = (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA)
-                      ? WIFI_IF_AP : WIFI_IF_STA;
-    Serial.printf("[ESP_NOW] Interface: %s\n",
-                  peer_info.ifidx == WIFI_IF_AP ? "AP" : "STA");
+    peer_info.ifidx = WIFI_IF_STA;
 
     if (esp_now_add_peer(&peer_info) != ESP_OK) {
         LOG_ERROR("Failed to add ESP_NOW broadcast peer");
@@ -687,74 +447,22 @@ void transmitViaESPNOW(ESP_CAN_Message_t* msg) {
     uint8_t broadcast_addr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
     esp_err_t result = esp_now_send(broadcast_addr, (uint8_t*)msg, sizeof(ESP_CAN_Message_t));
 
-    // Stats only in AP mode (save CPU in ESP_NOW-only mode)
-    if (ap_active) {
-        if (result == ESP_OK) {
-            stats_espnow_tx++;
-        } else {
-            stats_errors++;
-        }
+    // Stats
+    if (result == ESP_OK) {
+        stats_espnow_tx++;
+    } else {
+        stats_errors++;
     }
 }
 
 void onESPNOWSend(const uint8_t* mac_addr, esp_now_send_status_t status) {
-    if (ap_active && status != ESP_NOW_SEND_SUCCESS) {
+    if (status != ESP_NOW_SEND_SUCCESS) {
         LOG_DEBUG("ESP_NOW send failed");
     }
 }
 
 void onESPNOWReceive(const esp_now_recv_info_t *recv_info, const uint8_t* data, int data_len) {
-    if (ap_active) LOG_DEBUG("ESP_NOW RX from peer");
-}
-
-// =============================================================================
-// AP AUTO-SHUTDOWN & ESP_NOW TAKEOVER
-// =============================================================================
-
-void shutdownAPAndStartESPNOW(void) {
-    Serial.println("\n========================================");
-    Serial.println("  AP TIMEOUT — No client after 3 min");
-    Serial.println("  Switching to ESP_NOW-only mode");
-    Serial.println("========================================\n");
-
-    // 1. Stop UDP
-    udp.stop();
-    udp_buffer_offset = 0;
-    udp_buffer_count = 0;
-    Serial.println("[UDP] Stopped");
-
-    // 2. Deinit ESP-NOW before WiFi mode change
-    esp_now_deinit();
-    espnow_active = false;
-    Serial.println("[ESP_NOW] Deinit for mode switch");
-
-    // 3. Shut down WiFi AP
-    WiFi.softAPdisconnect(true);
-    Serial.println("[WiFi] AP shut down");
-
-    // 4. Switch to STA mode (required for ESP_NOW, no AP overhead)
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    WiFi.setSleep(false);
-    esp_wifi_set_channel(AP_CHANNEL, WIFI_SECOND_CHAN_NONE);
-    Serial.println("[WiFi] Mode: STA (no connection, ESP_NOW carrier)");
-
-    // 5. Re-initialize ESP_NOW on STA interface
-    initializeESPNOW();
-    espnow_active = true;
-    Serial.println("[ESP_NOW] Re-activated on STA interface");
-
-    // 6. Update state flags
-    ap_active = false;
-    ap_clients_count = 0;
-
-    // 7. Stop all debug output in ESP_NOW-only mode
-    Serial.println("\n========================================");
-    Serial.println("  MODE: ESP_NOW ONLY");
-    Serial.println("  All CPU dedicated to CAN → ESP_NOW");
-    Serial.println("  LED: OFF  |  Serial: errors only");
-    Serial.printf("  Free heap: %lu bytes\n", ESP.getFreeHeap());
-    Serial.println("========================================\n");
+    LOG_DEBUG("ESP_NOW RX from peer");
 }
 
 // =============================================================================
@@ -763,19 +471,11 @@ void shutdownAPAndStartESPNOW(void) {
 
 void printStatistics(void) {
     Serial.println("\n--- Stats ---");
-    Serial.printf("  Mode:         %s\n", ap_active ? "WiFi AP + UDP" : "ESP_NOW only");
+    Serial.printf("  Mode:         ESP_NOW only\n");
     Serial.printf("  MCP RX:       %lu (VehicleBus)\n", stats_mcp_rx);
     Serial.printf("  TWAI RX:      %lu (ChassisBus)\n", stats_twai_rx);
-    if (espnow_active) {
-        Serial.printf("  ESP_NOW TX:   %lu\n", stats_espnow_tx);
-    }
-    Serial.printf("  UDP frames:   %lu\n", stats_udp_tx);
-    Serial.printf("  UDP packets:  %lu (batches)\n", stats_udp_packets);
-    Serial.printf("  UDP skip:     %lu (no client)\n", stats_udp_skip);
+    Serial.printf("  ESP_NOW TX:   %lu\n", stats_espnow_tx);
     Serial.printf("  Errors:       %lu\n", stats_errors);
-    if (ap_active) {
-        Serial.printf("  WiFi clients: %d\n", ap_clients_count);
-    }
     Serial.printf("  Free heap:    %lu\n", ESP.getFreeHeap());
     Serial.printf("  Uptime:       %lu s\n", millis() / 1000);
     Serial.println("-------------\n");
