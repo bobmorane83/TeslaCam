@@ -6,6 +6,10 @@ Dashboard embarqué sans fil pour Tesla Model 3, composé de trois modules ESP32
 
 TeslaCam transforme un petit écran rond de 3,6 cm en un tableau de bord auxiliaire complet pour Tesla Model 3. Le système lit en temps réel les données du bus CAN du véhicule (vitesse, batterie, autonomie, rapport engagé, puissance, températures, clignotants, angles morts, freinage…) et les affiche sur un écran circulaire haute résolution.
 
+<p align="center">
+  <img src="Photos/exemple1.jpeg" alt="TeslaCam — Dashboard en fonctionnement" width="500"/>
+</p>
+
 En touchant l'écran, le dashboard bascule sur le flux vidéo d'une caméra frontale sans fil, permettant une vue avant en temps réel.
 
 ### Fonctionnalités affichées
