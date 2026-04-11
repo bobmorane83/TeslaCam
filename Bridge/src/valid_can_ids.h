@@ -28,13 +28,13 @@ const uint16_t VEHICLE_BUS_IDS[] = {
 };
 const uint16_t VEHICLE_BUS_IDS_COUNT = 135;
 
-// ── ChassisBus IDs (TWAI / built-in) ── 24 messages
+// ── ChassisBus IDs (TWAI / built-in) ── 25 messages
 const uint16_t CHASSIS_BUS_IDS[] = {
-    0x04F, 0x101, 0x111, 0x116, 0x145, 0x155, 0x175, 0x185,
+    0x045, 0x04F, 0x101, 0x111, 0x116, 0x145, 0x155, 0x175, 0x185,
     0x20E, 0x219, 0x238, 0x239, 0x24A, 0x25B, 0x2B9, 0x2D3,
     0x31F, 0x389, 0x399, 0x39D, 0x3D9, 0x3F3, 0x3F8, 0x3FD,
 };
-const uint16_t CHASSIS_BUS_IDS_COUNT = 24;
+const uint16_t CHASSIS_BUS_IDS_COUNT = 25;
 
 // ── Combined (for backward compat — binary search on sorted list) ──
 // Used when bus origin doesn't matter (ESP-NOW forwarding)

@@ -107,10 +107,11 @@ TaskHandle_t espnowTxTaskHandle = NULL;
 static unsigned long espnow_last_sent[2048] = {0};
 
 // ───────────────────────────────────────────────────────────────────────────
-// TURN SIGNAL PRIORITY IDs
+// PRIORITY CAN IDs (bypass ESP-NOW rate limiting)
 // ───────────────────────────────────────────────────────────────────────────
-#define TURN_CAN_ID_UI     0x311 // UI_warning: leftBlinkerBlinking / rightBlinkerBlinking
-#define TURN_CAN_ID_3F5    0x3F5 // VCFRONT_lighting (fallback)
+#define CAN_ID_VCFRONT_LIGHT 0x3F5  // Turn signal lamp status (VehicleBus)
+#define CAN_ID_TURN_STALK    0x045  // Turn signal lever position (ChassisBus)
+#define CAN_ID_BLIND_SPOT    0x399  // Blind spot warning (ChassisBus)
 unsigned long stats_mcp_rx = 0;       // MCP2515 (VehicleBus) frames received
 unsigned long stats_twai_rx = 0;      // TWAI (ChassisBus) frames received
 unsigned long stats_espnow_tx = 0;
@@ -504,8 +505,9 @@ void espnowTxTask(void* param) {
             bool priority = (msg.can_id == 0x257 || msg.can_id == 0x266 ||
                              msg.can_id == 0x2E5 || msg.can_id == 0x33A ||
                              msg.can_id == 0x292 ||
-                             msg.can_id == TURN_CAN_ID_UI ||
-                             msg.can_id == TURN_CAN_ID_3F5 ||
+                             msg.can_id == CAN_ID_VCFRONT_LIGHT ||
+                             msg.can_id == CAN_ID_TURN_STALK ||
+                             msg.can_id == CAN_ID_BLIND_SPOT ||
                              msg.can_id == 0x249);
 
             unsigned long now = millis();
