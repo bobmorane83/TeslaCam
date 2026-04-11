@@ -128,7 +128,11 @@ typedef struct __attribute__((packed)) {
 #define CAN_ID_STALK       0x249
 #define CAN_ID_BRAKE_LIGHT 0x3E2
 #define CAN_ID_BLIND_SPOT  0x399
+#define CAN_ID_TRIP_PLAN   0x082
 #define CAN_ID_HEARTBEAT 0xFFF
+
+/* Rated consumption: Tesla Model 3 "50" = 0.1377 kWh/km (from TeslaMate) */
+#define RATED_CONSUMPTION_KWH_PER_KM 0.1377f
 
 #define GEAR_INVALID 0
 #define GEAR_P       1
@@ -164,7 +168,10 @@ static volatile struct {
     bool     brakeLightOn;
     bool     blindSpotLeft;
     bool     blindSpotRight;
-} canData = { 0, GEAR_P, 0, false, 0, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0, 0, 0, 0, 0, false, 0.0f, false, 0.0f, false, false, false, false, false, false };
+    bool     tripActive;
+    float    energyAtDest;       // kWh, negative = won't make it
+    bool     energyAtDestValid;
+} canData = { 0, GEAR_P, 0, false, 0, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0, 0, 0, 0, 0, false, 0.0f, false, 0.0f, false, false, false, false, false, false, false, 0.0f, false };
 
 #define BRIDGE_TIMEOUT_MS 10000
 static volatile unsigned long lastBridgeMsg = 0;
@@ -244,6 +251,7 @@ static lv_obj_t *arcBatt;
 /* Labels */
 static lv_obj_t *lblSpeed;
 static lv_obj_t *lblSpeedUnit;
+static lv_obj_t *lblDestSoc = NULL;
 static lv_obj_t *lblTime;
 static lv_obj_t *lblRange;
 static lv_obj_t *lblRangeUnit;
@@ -348,6 +356,7 @@ static lv_obj_t   *arcBrake           = NULL;
 static bool        brakeVisible        = false;
 static volatile unsigned long lastBrakePedalMsg = 0;
 static volatile unsigned long lastBlindSpotMsg  = 0;
+static volatile unsigned long lastTripMsg       = 0;
 
 /* LV_IMG_CF_TRUE_COLOR_ALPHA: 3 bytes per pixel (2 color + 1 alpha) */
 #define TURN_CANVAS_BPP  LV_IMG_PX_SIZE_ALPHA_BYTE  // 3 bytes/pixel
@@ -620,6 +629,15 @@ static void createDashboard(void) {
     lv_obj_set_style_text_color(lblSpeedUnit, COL_TEAL, 0);
     lv_obj_align(lblSpeedUnit, LV_ALIGN_CENTER, 0, 14);
 
+    /* ── SoC at destination (shown only during active navigation) ── */
+    lblDestSoc = lv_label_create(scr);
+    lv_label_set_text(lblDestSoc, "");
+    lv_obj_set_style_text_font(lblDestSoc, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(lblDestSoc, COL_TEAL, 0);
+    lv_obj_set_style_text_align(lblDestSoc, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lblDestSoc, LV_ALIGN_CENTER, 0, 34);
+    lv_obj_add_flag(lblDestSoc, LV_OBJ_FLAG_HIDDEN);
+
     /* ── Range (left of SoC, between % and battery arc) ── */
     lblRange = lv_label_create(scr);
     lv_label_set_text(lblRange, "0");
@@ -802,6 +820,28 @@ static void updateDashboard(void) {
         char buf[4];
         snprintf(buf, sizeof(buf), "%d", (int)canData.uiSpeed);
         lv_label_set_text(lblSpeed, buf);
+    }
+
+    /* SoC at destination */
+    if (lblDestSoc) {
+        if (canData.tripActive && canData.energyAtDestValid
+            && canData.soc > 0 && canData.rangeKm > 0
+            && (now - lastTripMsg < 5000)) {
+            /* currentEnergy = rangeKm × rated_consumption (0.1377 kWh/km for Model 3 "50") */
+            float currentEnergy = canData.rangeKm * RATED_CONSUMPTION_KWH_PER_KM;
+            float socDest = (currentEnergy > 0.01f)
+                ? (float)canData.soc * canData.energyAtDest / currentEnergy
+                : 0.0f;
+            int socInt = (int)(socDest + 0.5f);
+            if (socInt < 0) socInt = 0;
+            if (socInt > 100) socInt = 100;
+            char dbuf[8];
+            snprintf(dbuf, sizeof(dbuf), "%d%%", socInt);
+            lv_label_set_text(lblDestSoc, dbuf);
+            lv_obj_clear_flag(lblDestSoc, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(lblDestSoc, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 
     /* Range */
@@ -1350,6 +1390,22 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
         }
         break;
 #endif // FEATURE_TURN_SIGNAL
+
+    case CAN_ID_TRIP_PLAN:
+        if (m->dlc >= 8) {
+            /* UI_tripPlanningActive: bit 0, 1 bit */
+            canData.tripActive = (m->data[0] & 0x01) == 1;
+            lastTripMsg = millis();
+            /* UI_energyAtDestination: bit 48, 16 bits, signed, factor 0.01 kWh */
+            int16_t rawE = (int16_t)(m->data[6] | ((uint16_t)m->data[7] << 8));
+            if (rawE != (int16_t)0x8000 && rawE != 0x7FFF) {
+                canData.energyAtDest = rawE * 0.01f;
+                canData.energyAtDestValid = true;
+            } else {
+                canData.energyAtDestValid = false;
+            }
+        }
+        break;
     }
 }
 
