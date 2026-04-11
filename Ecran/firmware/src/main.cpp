@@ -1031,10 +1031,6 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
     bridgeEverSeen = true;
 
 #if FEATURE_TURN_SIGNAL
-    /* Log turn-related CAN IDs for debugging */
-    if (m->can_id == 0x311 || m->can_id == 0x249) {
-        Serial.printf("[ESPNOW] id=0x%03X dlc=%u\n", m->can_id, m->dlc);
-    }
 #endif
 
     switch (m->can_id) {
@@ -1167,6 +1163,47 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
         break;
 
 #if FEATURE_TURN_SIGNAL
+    case CAN_ID_VCFRONT_LIGHT:
+        if (m->dlc >= 7) {
+            /* VCFRONT_turnSignalLeftStatus:  bit 50, 2 bits (byte 6, bits [3:2]) → 0=OFF, 1=ON */
+            /* VCFRONT_turnSignalRightStatus: bit 52, 2 bits (byte 6, bits [5:4]) → 0=OFF, 1=ON */
+            /* VCFRONT_hazardLightRequest:    bit 4, 4 bits  (byte 0, bits [7:4]) → 0=NONE */
+            /* VCFRONT_indicatorLeftRequest:  bit 0, 2 bits  (byte 0, bits [1:0]) → 0=OFF */
+            /* VCFRONT_indicatorRightRequest: bit 2, 2 bits  (byte 0, bits [3:2]) → 0=OFF */
+            uint8_t leftStatus  = (m->data[6] >> 2) & 0x03;
+            uint8_t rightStatus = (m->data[6] >> 4) & 0x03;
+            uint8_t hazardReq   = (m->data[0] >> 4) & 0x0F;
+            bool leftOn  = (leftStatus == 1 || leftStatus == 2);  // 1=ON phase, 2=OFF phase of blink
+            bool rightOn = (rightStatus == 1 || rightStatus == 2);
+            bool hazardOn = (hazardReq != 0);
+
+            unsigned long now = millis();
+            TurnMode newMode = TURN_OFF;
+
+            if (hazardOn && (leftOn || rightOn)) {
+                /* Hazard active — determine which side also has an individual turn */
+                if (leftOn && rightOn) {
+                    newMode = TURN_HAZARD;  // pure hazard
+                } else if (leftOn) {
+                    newMode = TURN_LEFT_HAZARD;
+                } else {
+                    newMode = TURN_RIGHT_HAZARD;
+                }
+            } else if (leftOn && rightOn) {
+                newMode = TURN_HAZARD;
+            } else if (leftOn) {
+                newMode = TURN_LEFT_CONT;
+            } else if (rightOn) {
+                newMode = TURN_RIGHT_CONT;
+            }
+
+            if (newMode != turnMode) {
+                turnMode = newMode;
+                turnArmedMs = (newMode != TURN_OFF) ? now : 0;
+            }
+        }
+        break;
+
     case CAN_ID_UI_WARNING:
         if (m->dlc >= 4) {
             uint8_t leftBlink  = m->data[3] & 0x03;
@@ -1199,7 +1236,7 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
 
     case CAN_ID_STALK:
         if (m->dlc >= 3) {
-            uint8_t stalk = m->data[2] & 0x07;
+            uint8_t stalk = m->data[2] & 0x0F;  // SCCM_turnIndicatorStalkStatus: bit 16, 4 bits
             if (turnFromUIWarning) break;  // UI_Warning has priority over stalk
             unsigned long now = millis();
             bool leftWas  = (turnMode == TURN_LEFT_3  || turnMode == TURN_LEFT_CONT);
@@ -1220,8 +1257,6 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
                     turnArmedMs = now;
                 }
             }
-            if (stalk != 0)
-                Serial.printf("[249] stalk=%u mode=%d t=%lu\n", stalk, turnMode, now);
         }
         break;
 #endif // FEATURE_TURN_SIGNAL
