@@ -38,7 +38,7 @@ CAN Bus (onboard screw terminal):
 
 Other:
 - Serial/Debug: USB-C JTAG/CDC @ 115200 baud
-- TWAI: GPIO 7 (TX), GPIO 6 (RX) — not used (MCP2515 preferred)
+- TWAI: GPIO 7 (TX), GPIO 6 (RX) — ChassisBus (built-in CAN controller)
 ```
 
 ---

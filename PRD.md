@@ -2,7 +2,7 @@
 
 ## 1. Résumé du projet
 
-Système embarqué de caméra de recul pour Tesla composé de deux ESP32-S3 communiquant en Wi-Fi. L'ESP32-S3 **Camera** capture une photo JPEG 360×360 via le capteur OV5640, puis l'envoie à l'ESP32-S3 **Écran** qui l'affiche sur un écran rond ST77916 (360×360 pixels).
+Système embarqué de caméra frontale pour Tesla composé de deux ESP32-S3 communiquant en Wi-Fi. L'ESP32-S3 **Camera** capture une photo JPEG 360×360 via le capteur OV5640, puis l'envoie à l'ESP32-S3 **Écran** qui l'affiche sur un écran rond ST77916 (360×360 pixels).
 
 ---
 
@@ -60,7 +60,7 @@ Basé sur l'analyse du Guide.txt, le protocole **SoftAP + UDP raw** est retenu c
 | CAM-02 | Créer un Access Point Wi-Fi | SSID : `TeslaCam`, pas de mot de passe (réseau local fermé). IP : `192.168.4.1`. |
 | CAM-03 | Envoyer les frames via UDP chunked | Découper chaque JPEG en chunks ≤ 1452 bytes avec header 8 bytes. Port destination : `5000`. |
 | CAM-04 | Cadence cible | ≥ 15 fps en continu (quand le streaming est actif). |
-| CAM-05 | Miroir horizontal + flip vertical | Image retournée pour montage caméra de recul (configurable). |
+| CAM-05 | Miroir horizontal + flip vertical | Image retournée pour montage caméra frontale (configurable). |
 | CAM-06 | Task FreeRTOS dédiée | Le streaming tourne sur un core dédié (core 1) pour ne pas bloquer le système. |
 | CAM-07 | Mode veille par défaut | Au démarrage, la caméra **n'émet pas**. Elle attend une commande `START` de l'Écran via UDP avant de commencer la capture et l'envoi. Sur réception d'une commande `STOP`, elle cesse la capture et repasse en veille (économie d'énergie et réduction de la chauffe). |
 
@@ -164,7 +164,7 @@ sensor_t *s = esp_camera_sensor_get();
 s->set_framesize(s, FRAMESIZE_HVGA);   // 480×320, puis crop/resize à 360×360
 s->set_quality(s, 10);                  // Qualité JPEG (bon compromis taille/qualité)
 s->set_pixformat(s, PIXFORMAT_JPEG);
-s->set_vflip(s, 1);                    // Flip vertical (caméra de recul)
+s->set_vflip(s, 1);                    // Flip vertical (caméra frontale)
 s->set_hmirror(s, 1);                  // Miroir horizontal
 ```
 
@@ -206,10 +206,10 @@ s->set_hmirror(s, 1);                  // Miroir horizontal
 | Display driver | Arduino_GFX (ST77916 QSPI) |
 | Décodage JPEG | JPEGDEC (bitbank2) |
 | Wi-Fi | Mode Station |
-| ESP-NOW | Réception trames Bridge (canal 6) |
+| ESP-NOW | Réception trames Bridge (canal 1) |
 | Transport | lwip UDP raw (ports 5000, 5001) |
 
-### Bridge (`bridge/`)
+### Bridge (`Bridge/`)
 
 | Composant | Choix |
 |---|---|
@@ -263,7 +263,7 @@ lib_deps =
 - [x] **Camera** : Écouter le port 5001 pour les commandes de contrôle
 
 ### Phase 5 — Intégration Bridge CAN + Dashboard
-- [x] **Camera** : Configurer le SoftAP sur canal Wi-Fi 6 (alignement avec Bridge ESP-NOW)
+- [x] **Camera** : Configurer le SoftAP sur canal Wi-Fi 1 (alignement avec Bridge ESP-NOW)
 - [x] **Écran** : Initialiser ESP-NOW après connexion Wi-Fi pour recevoir les broadcasts du Bridge
 - [x] **Écran** : Décoder 6 signaux CAN depuis les trames ESP-NOW (vitesse, rapport, SoC, range, temp, puissance)
 - [x] **Écran** : Implémenter le dashboard complet (arcs, vitesse, rapport, widgets, regen) inspiré du mockup HTML

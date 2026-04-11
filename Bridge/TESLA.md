@@ -2,7 +2,7 @@
 
 Documentation complète des messages et signaux CAN du Tesla Model 3 (2022).
 Chaque signal est accompagné d'une description lisible en français.
-Source : `bridge/tesla_can.dbc`.
+Source : `Can/tesla_can.dbc`.
 
 ## Table des matières
 
@@ -153,7 +153,7 @@ Source : `bridge/tesla_can.dbc`.
 | `GTW_BMP_PMIC_PWR_ON` | — | Mise sous tension du circuit d'alimentation de la passerelle |
 | `GTW_bmpState` | — | État du processeur de gestion d'énergie de la passerelle. Valeurs : BMP_STATE_OFF (0), BMP_STATE_ON (1), BMP_STATE_ASLEEP (2), BMP_STATE_MIA (3), BMP_STATE_RESET (4), BMP_STATE_POWER_CYCLE (5), DUMMY (255) |
 
-### 0x118 — riveSystemStatus
+### 0x118 — DriveSystemStatus
 
 **Système de traction : rapport engagé (P/R/N/D), couple, vitesse, état de l'onduleur, pédale** | Cycle : 10 ms
 

@@ -53,7 +53,7 @@ Le module MCP2515 est intégré sur la carte T-2CAN. Pas de câblage SPI externe
 
 ### Vérifié
 
-- [x] LilyGo T-2CAN bran ché via USB-C
+- [x] LilyGo T-2CAN branché via USB-C
 - [x] MCP2515 détecté (SPI OK)
 - [x] Crystal 16 MHz OK
 - [x] ESP-NOW broadcast OK (heartbeat 1s)
@@ -92,7 +92,7 @@ GND   ──→ GND (common)
 # Cet ESP32 fonctionne et est prêt
 
 # Obtenir:
-1. □ Module MCP2515 (spec: SPI, 8 MHz crystal)
+1. □ Module MCP2515 (spec: SPI, 16 MHz crystal)
 2. □ Connecteur CAN compatible Tesla
 3. □ Câbles et connecteurs
 4. □ Multimètre pour test continuité
@@ -116,7 +116,7 @@ GND   ──→ GND (common)
 [CAN RX] ID: 0x1F9 DLC: 5 Data: ...
 [CAN RX] ID: 0x246 DLC: 8 Data: ...
 
-# LED clignote: ✅ Chaque message CAN reçu = 10ms pulse
+# Moniteur série : messages CAN reçus en temps réel
 ```
 
 ### Phase 4: Ajouter d'autres ESP32 (optional)
@@ -138,7 +138,7 @@ GND   ──→ GND (common)
 │                         │
 │ • CAN RX: 500 kbps      │ ──┐
 │ • WiFi: ESP_NOW Mode    │   │ (Attends hardware)
-│ • LED: GPIO 2 (pulse)   │   │
+│ • CAN: SPI polling       │   │
 │ • Serial: Debug 115200  │   │
 └─────────────────────────┘   │
                               │
@@ -168,10 +168,10 @@ GND   ──→ GND (common)
 - Message structure: 24 bytes (ID + data + timestamp)
 - Encryption disabled (optimisé pour vitesse)
 
-✅ **LED Feedback**
-- 10ms pulse par message CAN
+✅ **Serial Feedback**
+- Serial debug logs par message CAN
 - State machine non-bloquante
-- Visible feedback of activity
+- No user LED on T-2CAN — use serial monitor
 
 ✅ **Logging & Statistics**
 - Serial debug @ 115200 baud
@@ -192,9 +192,9 @@ GND   ──→ GND (common)
 ```
 Speed:        500 kbps (standard Tesla)
 ID Type:      11-bit standard
-Mode:         Normal (RX + TX)
+Mode:         Listen-only (RX)
 Filters:      Masters all messages
-Interrupt:    GPIO 4 (MCP_INT)
+Interrupt:    No INT pin (SPI polling)
 ```
 
 ### Configuration ESP_NOW

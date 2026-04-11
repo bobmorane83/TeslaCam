@@ -61,15 +61,17 @@ GND    ──→  MCP2515 GND (common ground)
 - **Speed:** 500 kbps
 - **ID Type:** Standard 11-bit
 - **Data Rate:** Up to 500+ messages/second
-- **Common IDs:**
+- **Common IDs (priority):**
   ```
-  0x118, 0x11A, 0x11B - Motor/Speed data
-  0x1F9              - Battery information
-  0x246              - Steering angle
-  0x248              - Accelerator pedal
-  0x250, 0x252       - Wheel speeds (ABS)
-  0x260, 0x262       - Odometer/Distance
-  0x3A0, 0x3A2       - Temperature sensors
+  0x118              - Gear (P/R/N/D), brake pedal
+  0x257              - Vehicle speed (UI)
+  0x266              - Rear motor power
+  0x292              - Battery SoC (BMS)
+  0x2E5              - Front motor power
+  0x33A              - Range, UI SoC
+  0x3E2              - Brake light status
+  0x3F5              - Turn signals (VCFRONT)
+  0x399              - Blindspot detection (DAS)
   ```
 
 - **Filter Configuration**
@@ -102,7 +104,7 @@ struct ESP_CAN_Message_t {
     uint8_t  is_extended;  // ID type flag
 };
 ```
-**Total Size:** ~24 bytes per message (efficient ESP_NOW payload)
+**Total Size:** 18 bytes per message (packed struct, efficient ESP_NOW payload)
 
 ### WiFi Configuration
 - **Mode:** AP at boot (SSID: "bridge"), then STA-only after 3 min timeout
@@ -129,7 +131,7 @@ struct ESP_CAN_Message_t {
 - SPI bus setup
 - MCP2515 configuration (500 kbps)
 - CAN filters for Tesla IDs
-- Interrupt attachment
+- SPI polling setup (no interrupt)
 
 #### 2. **checkCANBus()**
 - Polls MCP2515 via SPI (`checkReceive()`)
