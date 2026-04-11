@@ -126,6 +126,7 @@ typedef struct __attribute__((packed)) {
 #define CAN_ID_UI_WARNING  0x311
 #define CAN_ID_VCFRONT_LIGHT 0x3F5
 #define CAN_ID_STALK       0x249
+#define CAN_ID_BRAKE_LIGHT 0x3E2
 #define CAN_ID_HEARTBEAT 0xFFF
 
 #define GEAR_INVALID 0
@@ -159,7 +160,8 @@ static volatile struct {
     bool     cabinTempReceived;
     bool     leftTurnOn;
     bool     rightTurnOn;
-} canData = { 0, GEAR_P, 0, false, 0, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0, 0, 0, 0, 0, false, 0.0f, false, 0.0f, false, false, false };
+    bool     brakeLightOn;
+} canData = { 0, GEAR_P, 0, false, 0, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0, 0, 0, 0, 0, false, 0.0f, false, 0.0f, false, false, false, false };
 
 #define BRIDGE_TIMEOUT_MS 10000
 static volatile unsigned long lastBridgeMsg = 0;
@@ -338,6 +340,10 @@ static void recolorCanvas(uint8_t *buf, lv_color_t col) {
  * ====================================================================== */
 static lv_color_t *turnCanvasBufLeft  = NULL;
 static lv_color_t *turnCanvasBufRight = NULL;
+static lv_color_t *brakeCanvasBuf     = NULL;
+static lv_obj_t   *arcBrake           = NULL;
+static bool        brakeVisible        = false;
+static volatile unsigned long lastBrakePedalMsg = 0;
 
 /* LV_IMG_CF_TRUE_COLOR_ALPHA: 3 bytes per pixel (2 color + 1 alpha) */
 #define TURN_CANVAS_BPP  LV_IMG_PX_SIZE_ALPHA_BYTE  // 3 bytes/pixel
@@ -346,7 +352,7 @@ static lv_color_t *turnCanvasBufRight = NULL;
 /* Pre-render the halo glow for one side into canvas buffer (TRUE_COLOR_ALPHA).
  * Buffer layout: [color_low, color_high, alpha] per pixel */
 static void prerenderTurnHalo(uint8_t *buf, int side) {
-    float centerDeg = (side == 1) ? 0.0f : 180.0f;
+    float centerDeg = (side == 0) ? 180.0f : (side == 1) ? 0.0f : 270.0f;
     float halfSpan = TURN_ARC_SPAN / 2.0f;
     float tipFade  = (float)TURN_TIP_FADE;
 
@@ -725,6 +731,23 @@ static void createDashboard(void) {
         } else {
             Serial.println("[TURN] PSRAM alloc failed for halo canvases");
         }
+
+        /* Brake light halo (bottom, red) */
+        brakeCanvasBuf = (lv_color_t *)heap_caps_malloc(TURN_CANVAS_SIZE, MALLOC_CAP_SPIRAM);
+        if (brakeCanvasBuf) {
+            Serial.println("[BRAKE] Pre-rendering halo canvas...");
+            prerenderTurnHalo((uint8_t *)brakeCanvasBuf, 2);  // bottom
+            recolorCanvas((uint8_t *)brakeCanvasBuf, COL_HALO_RED);
+            Serial.println("[BRAKE] Halo canvas ready");
+
+            arcBrake = lv_canvas_create(scr);
+            lv_canvas_set_buffer(arcBrake, brakeCanvasBuf, SCREEN_W, SCREEN_H, LV_IMG_CF_TRUE_COLOR_ALPHA);
+            lv_obj_center(arcBrake);
+            lv_obj_clear_flag(arcBrake, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_flag(arcBrake, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            Serial.println("[BRAKE] PSRAM alloc failed for brake halo canvas");
+        }
     }
 #endif // FEATURE_TURN_SIGNAL
 
@@ -1016,6 +1039,25 @@ static void updateDashboard(void) {
             lv_obj_add_flag(arcTurnRight, LV_OBJ_FLAG_HIDDEN);
         }
     }
+
+    /* Brake light halo (solid red at bottom) */
+    if (arcBrake) {
+        /* Timeout: if no 0x118 for 400ms, treat brake as OFF */
+        bool brakeActive = canData.brakeLightOn && (now - lastBrakePedalMsg < 400);
+        if (brakeActive) {
+            if (!brakeVisible) {
+                brakeVisible = true;
+                lv_obj_clear_flag(arcBrake, LV_OBJ_FLAG_HIDDEN);
+            }
+            lv_obj_set_style_img_opa(arcBrake, LV_OPA_COVER, 0);
+            lv_obj_invalidate(arcBrake);
+        } else {
+            if (brakeVisible) {
+                brakeVisible = false;
+                lv_obj_add_flag(arcBrake, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+    }
 #endif // FEATURE_TURN_SIGNAL
 }
 
@@ -1030,6 +1072,8 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
     espNowRxCount++;
     lastBridgeMsg = millis();
     bridgeEverSeen = true;
+
+
 
 #if FEATURE_TURN_SIGNAL
 #endif
@@ -1261,6 +1305,16 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
                     turnArmedMs = now;
                 }
             }
+        }
+        break;
+
+
+    case CAN_ID_BRAKE_LIGHT:
+        if (m->dlc >= 1) {
+            /* VCLEFT_brakeLightStatus: bit 0, 2 bits — 0=OFF, 1=ON, 2=FAULT, 3=SNA */
+            uint8_t status = m->data[0] & 0x03;
+            canData.brakeLightOn = (status == 1);
+            lastBrakePedalMsg = millis();
         }
         break;
 #endif // FEATURE_TURN_SIGNAL

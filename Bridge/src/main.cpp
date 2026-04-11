@@ -509,7 +509,8 @@ void espnowTxTask(void* param) {
                              msg.can_id == CAN_ID_TURN_STALK ||
                              msg.can_id == CAN_ID_BLIND_SPOT ||
                              msg.can_id == 0x249 ||
-                             msg.can_id == 0x311);  // UI_WARNING (turn signals)
+                             msg.can_id == 0x311 ||  // UI_WARNING (turn signals)
+                             msg.can_id == 0x3E2);   // VCLEFT brake light
 
             unsigned long now = millis();
             if (priority || now - espnow_last_sent[idx] >= ESPNOW_MIN_INTERVAL_MS) {
