@@ -109,7 +109,8 @@ typedef struct __attribute__((packed)) {
 } ESP_CAN_Message_t;
 
 /* ── Feature flags ── */
-#define FEATURE_TURN_SIGNAL 0   // Set to 1 to enable turn signal halo
+#define FEATURE_TURN_SIGNAL 1   // Set to 1 to enable turn signal halo
+#define TURN_SIGNAL_TEST    0   // Set to 1 to auto-cycle turn signals for testing
 
 #define CAN_ID_SPEED     0x257
 #define CAN_ID_GEAR      0x118
@@ -202,6 +203,11 @@ static const lv_color_t COL_GREEN    = MKCOL(0, 255, 0);
 
 static const lv_color_t COL_GREY     = MKCOL(80, 80, 80);
 
+/* Vivid halo colors (fully saturated for turn signal glow) */
+static const lv_color_t COL_HALO_GREEN = MKCOL(0, 255, 0);
+static const lv_color_t COL_HALO_AMBER = MKCOL(255, 210, 0);
+static const lv_color_t COL_HALO_RED   = MKCOL(255, 0, 0);
+
 static lv_color_t lvSpeedColor(int speed) {
     (void)speed;
     return COL_GREEN;
@@ -274,12 +280,31 @@ static unsigned long turnLeftOnMs = 0;      // when this blink started showing
 static unsigned long turnRightOnMs = 0;
 
 /* Turn signal activation via stalk (0x249) or UI_warning (0x311) */
-enum TurnMode { TURN_OFF = 0, TURN_LEFT_3, TURN_LEFT_CONT, TURN_RIGHT_3, TURN_RIGHT_CONT };
+enum TurnMode { TURN_OFF = 0, TURN_LEFT_3, TURN_LEFT_CONT, TURN_RIGHT_3, TURN_RIGHT_CONT,
+                TURN_HAZARD, TURN_LEFT_HAZARD, TURN_RIGHT_HAZARD };
 static volatile TurnMode turnMode = TURN_OFF;
 static volatile unsigned long turnArmedMs = 0;  // when turn was activated
+static volatile bool turnFromUIWarning = false;  // true = 0x311 is driving turn mode
 #define TURN_3BLINK_MS    1500   // 3 blinks × 500ms each
 #define TURN_CONT_MS     30000   // continuous mode timeout (30s)
 #define TURN_REVEAL_MS     150   // reveal animation time
+
+/* Track current halo color per side to avoid redundant recoloring */
+static lv_color_t turnLeftColor  = MKCOL(0, 0, 0);
+static lv_color_t turnRightColor = MKCOL(0, 0, 0);
+
+/* Recolor a pre-rendered TRUE_COLOR_ALPHA canvas buffer (keeps alpha intact) */
+static void recolorCanvas(uint8_t *buf, lv_color_t col) {
+    uint8_t cl = col.full & 0xFF;
+    uint8_t ch = (col.full >> 8) & 0xFF;
+    for (int i = 0; i < SCREEN_W * SCREEN_H; i++) {
+        int idx = i * 3;
+        if (buf[idx + 2] != 0) {  // only non-transparent pixels
+            buf[idx]     = cl;
+            buf[idx + 1] = ch;
+        }
+    }
+}
 #endif // FEATURE_TURN_SIGNAL
 
 /* ── Speed arc angles ── */
@@ -304,7 +329,7 @@ static volatile unsigned long turnArmedMs = 0;  // when turn was activated
 #if FEATURE_TURN_SIGNAL
 /* Turn signal halo: quarter circle (90°), radial gradient via pre-rendered canvas */
 #define TURN_ARC_SPAN    90    // 90° arc = quarter circle
-#define TURN_HALO_WIDTH  90    // gradient depth from edge inward (pixels)
+#define TURN_HALO_WIDTH  110   // gradient depth from edge inward (pixels)
 #define TURN_TIP_FADE    20    // degrees of angular fade at each tip
 
 /* ======================================================================
@@ -368,7 +393,7 @@ static void prerenderTurnHalo(uint8_t *buf, int side) {
             if (alpha > 1.0f) alpha = 1.0f;
 
             uint8_t a8 = (uint8_t)(alpha * 200.0f);  // max 200 for semi-transparency
-            lv_color_t col = COL_GREEN;
+            lv_color_t col = COL_GREEN;  // default; recolored at runtime per mode
 
             /* LVGL TRUE_COLOR_ALPHA: byte0 = color low, byte1 = color high, byte2 = alpha */
             buf[idx]     = col.full & 0xFF;
@@ -893,6 +918,9 @@ static void updateDashboard(void) {
     {
         /* Check if turn mode has expired */
         bool leftActive = false, rightActive = false;
+        bool leftBlinks = true, rightBlinks = true;  // false = solid (hazard)
+        lv_color_t leftCol = COL_HALO_GREEN, rightCol = COL_HALO_GREEN;
+
         if (turnMode != TURN_OFF && turnArmedMs != 0) {
             unsigned long elapsed = now - turnArmedMs;
             unsigned long timeout = (turnMode == TURN_LEFT_3 || turnMode == TURN_RIGHT_3)
@@ -901,32 +929,86 @@ static void updateDashboard(void) {
                 turnMode = TURN_OFF;
                 turnArmedMs = 0;
             } else {
-                leftActive  = (turnMode == TURN_LEFT_3  || turnMode == TURN_LEFT_CONT);
-                rightActive = (turnMode == TURN_RIGHT_3 || turnMode == TURN_RIGHT_CONT);
+                switch (turnMode) {
+                    case TURN_LEFT_3:
+                    case TURN_LEFT_CONT:
+                        leftActive = true;  leftCol = COL_HALO_GREEN;  leftBlinks = true;
+                        break;
+                    case TURN_RIGHT_3:
+                    case TURN_RIGHT_CONT:
+                        rightActive = true; rightCol = COL_HALO_GREEN;  rightBlinks = true;
+                        break;
+                    case TURN_HAZARD:
+                        leftActive = true;  rightActive = true;
+                        leftCol = COL_HALO_AMBER; rightCol = COL_HALO_AMBER;
+                        leftBlinks = false;  rightBlinks = false;  // solid
+                        break;
+                    case TURN_LEFT_HAZARD:
+                        leftActive = true;  leftCol = COL_HALO_RED;    leftBlinks = true;
+                        rightActive = true; rightCol = COL_HALO_AMBER; rightBlinks = false;
+                        break;
+                    case TURN_RIGHT_HAZARD:
+                        leftActive = true;  leftCol = COL_HALO_AMBER;  leftBlinks = false;
+                        rightActive = true; rightCol = COL_HALO_RED;    rightBlinks = true;
+                        break;
+                    default: break;
+                }
             }
+        }
+
+        /* Recolor canvases if color changed */
+        if (leftActive && leftCol.full != turnLeftColor.full) {
+            recolorCanvas((uint8_t *)turnCanvasBufLeft, leftCol);
+            turnLeftColor = leftCol;
+        }
+        if (rightActive && rightCol.full != turnRightColor.full) {
+            recolorCanvas((uint8_t *)turnCanvasBufRight, rightCol);
+            turnRightColor = rightCol;
         }
 
         /* Own 500ms blink cycle */
         bool blinkPhase = (now / 500) % 2 == 0;
 
-        if (leftActive && blinkPhase) {
+        /* Left side */
+        bool showLeft = leftActive && (!leftBlinks || blinkPhase);
+        if (showLeft) {
             if (!turnLeftVisible) {
                 turnLeftOnMs = now;
                 turnLeftVisible = true;
             }
             lv_obj_clear_flag(arcTurnLeft, LV_OBJ_FLAG_HIDDEN);
+            if (leftBlinks) {
+                /* Reveal fade-in over TURN_REVEAL_MS */
+                unsigned long elapsedL = now - turnLeftOnMs;
+                lv_opa_t opaL = (elapsedL >= TURN_REVEAL_MS) ? LV_OPA_COVER
+                                : (lv_opa_t)(LV_OPA_COVER * elapsedL / TURN_REVEAL_MS);
+                lv_obj_set_style_img_opa(arcTurnLeft, opaL, 0);
+            } else {
+                lv_obj_set_style_img_opa(arcTurnLeft, LV_OPA_COVER, 0);
+            }
             lv_obj_invalidate(arcTurnLeft);
         } else {
             turnLeftVisible = false;
             lv_obj_add_flag(arcTurnLeft, LV_OBJ_FLAG_HIDDEN);
         }
 
-        if (rightActive && blinkPhase) {
+        /* Right side */
+        bool showRight = rightActive && (!rightBlinks || blinkPhase);
+        if (showRight) {
             if (!turnRightVisible) {
                 turnRightOnMs = now;
                 turnRightVisible = true;
             }
             lv_obj_clear_flag(arcTurnRight, LV_OBJ_FLAG_HIDDEN);
+            if (rightBlinks) {
+                /* Reveal fade-in over TURN_REVEAL_MS */
+                unsigned long elapsedR = now - turnRightOnMs;
+                lv_opa_t opaR = (elapsedR >= TURN_REVEAL_MS) ? LV_OPA_COVER
+                                : (lv_opa_t)(LV_OPA_COVER * elapsedR / TURN_REVEAL_MS);
+                lv_obj_set_style_img_opa(arcTurnRight, opaR, 0);
+            } else {
+                lv_obj_set_style_img_opa(arcTurnRight, LV_OPA_COVER, 0);
+            }
             lv_obj_invalidate(arcTurnRight);
         } else {
             turnRightVisible = false;
@@ -1090,15 +1172,25 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
             uint8_t leftBlink  = m->data[3] & 0x03;
             uint8_t rightBlink = (m->data[3] >> 2) & 0x03;
             unsigned long now = millis();
-            if (leftBlink != 0 && turnMode == TURN_OFF) {
+            turnFromUIWarning = (leftBlink != 0 || rightBlink != 0);
+            if (leftBlink != 0 && rightBlink != 0) {
+                /* Hazard lights: both sides active — check if a stalk turn was active */
+                bool wasLeft  = (turnMode == TURN_LEFT_3  || turnMode == TURN_LEFT_CONT);
+                bool wasRight = (turnMode == TURN_RIGHT_3 || turnMode == TURN_RIGHT_CONT);
+                if (wasLeft)       { turnMode = TURN_LEFT_HAZARD;  turnArmedMs = now; }
+                else if (wasRight) { turnMode = TURN_RIGHT_HAZARD; turnArmedMs = now; }
+                else               { turnMode = TURN_HAZARD;       turnArmedMs = now; }
+            } else if (leftBlink != 0) {
                 turnMode = TURN_LEFT_CONT; turnArmedMs = now;
-            } else if (leftBlink == 0 && (turnMode == TURN_LEFT_3 || turnMode == TURN_LEFT_CONT)) {
-                turnMode = TURN_OFF; turnArmedMs = 0;
-            }
-            if (rightBlink != 0 && turnMode == TURN_OFF) {
+            } else if (rightBlink != 0) {
                 turnMode = TURN_RIGHT_CONT; turnArmedMs = now;
-            } else if (rightBlink == 0 && (turnMode == TURN_RIGHT_3 || turnMode == TURN_RIGHT_CONT)) {
-                turnMode = TURN_OFF; turnArmedMs = 0;
+            } else {
+                /* Both off — cancel any UI_Warning-driven mode */
+                if (turnMode == TURN_LEFT_CONT || turnMode == TURN_RIGHT_CONT ||
+                    turnMode == TURN_HAZARD || turnMode == TURN_LEFT_HAZARD || turnMode == TURN_RIGHT_HAZARD) {
+                    turnMode = TURN_OFF; turnArmedMs = 0;
+                    turnFromUIWarning = false;
+                }
             }
             Serial.printf("[311] d3=%02X L=%u R=%u mode=%d t=%lu\n",
                           m->data[3], leftBlink, rightBlink, turnMode, now);
@@ -1108,6 +1200,7 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
     case CAN_ID_STALK:
         if (m->dlc >= 3) {
             uint8_t stalk = m->data[2] & 0x07;
+            if (turnFromUIWarning) break;  // UI_Warning has priority over stalk
             unsigned long now = millis();
             bool leftWas  = (turnMode == TURN_LEFT_3  || turnMode == TURN_LEFT_CONT);
             bool rightWas = (turnMode == TURN_RIGHT_3 || turnMode == TURN_RIGHT_CONT);
@@ -1439,6 +1532,13 @@ void setup() {
     /* First LVGL render */
     lv_timer_handler();
     Serial.println("[DASH] LVGL Dashboard ready - touch to activate camera");
+
+#if TURN_SIGNAL_TEST
+    /* Force bridge as seen so dashboard renders active (not greyed out) */
+    bridgeEverSeen = true;
+    lastBridgeMsg = millis();
+    Serial.println("[TEST] Turn signal test mode active — cycling every 3s");
+#endif
 }
 
 /* ======================================================================
@@ -1464,6 +1564,28 @@ void loop() {
                       now, streamActive, (int)bridgeEverSeen, canData.soc, canData.rangeKm, pCh, espNowRxCount);
 #endif
     }
+
+#if FEATURE_TURN_SIGNAL && TURN_SIGNAL_TEST
+    /* ── Turn signal test: cycle through all modes every 3s ── */
+    {
+        static unsigned long testLastMs = 0;
+        static int testPhase = -1;  // -1 = not started yet
+        if (testPhase == -1 && now > 3000) { testPhase = 0; testLastMs = now; }  // start after 3s boot
+        if (testPhase >= 0 && (now - testLastMs >= 3000)) {
+            testLastMs = now;
+            lastBridgeMsg = now;  // keep bridge "alive" for dashboard rendering
+            testPhase = (testPhase + 1) % 6;
+            switch (testPhase) {
+                case 0: turnMode = TURN_LEFT_CONT;    turnArmedMs = now; Serial.println("[TEST] LEFT GREEN blink"); break;
+                case 1: turnMode = TURN_RIGHT_CONT;   turnArmedMs = now; Serial.println("[TEST] RIGHT GREEN blink"); break;
+                case 2: turnMode = TURN_HAZARD;        turnArmedMs = now; Serial.println("[TEST] HAZARD AMBER solid"); break;
+                case 3: turnMode = TURN_LEFT_HAZARD;   turnArmedMs = now; Serial.println("[TEST] LEFT+HAZARD RED blink"); break;
+                case 4: turnMode = TURN_RIGHT_HAZARD;  turnArmedMs = now; Serial.println("[TEST] RIGHT+HAZARD RED blink"); break;
+                case 5: turnMode = TURN_OFF;            turnArmedMs = 0;  Serial.println("[TEST] OFF"); break;
+            }
+        }
+    }
+#endif
 
     /* ── WiFi connection management ── */
     if (!wifiConnected && WiFi.status() == WL_CONNECTED) {
