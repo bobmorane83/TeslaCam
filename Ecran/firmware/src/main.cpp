@@ -122,6 +122,7 @@ typedef struct __attribute__((packed)) {
 #define CAN_ID_BMS_SOC   0x292
 #define CAN_ID_UTC_TIME  0x318
 #define CAN_ID_THS_STATUS  0x383
+#define CAN_ID_HVAC_STATUS 0x243
 #define CAN_ID_UI_WARNING  0x311
 #define CAN_ID_VCFRONT_LIGHT 0x3F5
 #define CAN_ID_STALK       0x249
@@ -1091,11 +1092,6 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
             uint16_t rawMax = ((m->data[6] >> 5) & 0x07) | ((uint16_t)m->data[7] << 3);
             rawMax &= 0x1FF;
             canData.battTempMax = rawMax * 0.25f - 25.0f;
-
-            Serial.printf("[CAN] 0x312 raw: %02X %02X %02X %02X %02X %02X %02X %02X → min=%.1f max=%.1f\n",
-                          m->data[0], m->data[1], m->data[2], m->data[3],
-                          m->data[4], m->data[5], m->data[6], m->data[7],
-                          canData.battTempMin, canData.battTempMax);
         }
         break;
     }
@@ -1120,14 +1116,22 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
         }
         break;
 
-    case CAN_ID_THS_STATUS:
-        if (m->dlc >= 2) {
-            /* VCRIGHT_thsTemperature: start_bit 1, 8 bits, LE signed, ×1 −40°C */
-            uint8_t rawU = ((m->data[0] >> 1) & 0x7F) | ((m->data[1] & 0x01) << 7);
-            if (rawU != 128) {  /* 128 = SNA */
-                int8_t rawS = (int8_t)rawU;
-                canData.cabinTemp = rawS - 40.0f;
-                canData.cabinTempReceived = true;
+    case CAN_ID_HVAC_STATUS:
+        if (m->dlc >= 6) {
+            /* Multiplexed: VCRIGHT_hvacStatusIndex is bits [1:0] of byte 0 */
+            uint8_t muxIdx = m->data[0] & 0x03;
+            if (muxIdx == 0) {
+                /* VCRIGHT_hvacCabinTempEst: start_bit 30, 11 bits, LE unsigned, ×0.1 −40°C */
+                uint16_t raw = ((m->data[3] >> 6) & 0x03)
+                             | ((uint16_t)m->data[4] << 2)
+                             | (((uint16_t)m->data[5] & 0x01) << 10);
+                if (raw < 2040) {  /* ≥2040 → SNA (climate off or unavailable) */
+                    float t = raw * 0.1f - 40.0f;
+                    if (t >= -40.0f && t <= 85.0f) {  /* sanity range */
+                        canData.cabinTemp = t;
+                        canData.cabinTempReceived = true;
+                    }
+                }
             }
         }
         break;
