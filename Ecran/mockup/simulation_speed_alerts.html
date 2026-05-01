@@ -388,7 +388,7 @@ function speedGlow(col) {
 /* ── Dessin Bezel ── */
 function drawBezel(ctx) {
   ctx.clearRect(0,0,360,360);
-  const sa=-PI*0.75, ea=PI*0.75, rng=ea-sa;
+  const sa=PI*0.75, ea=PI*2.25, rng=ea-sa;
   for(let i=0;i<=36;i++){
     const a=sa+(i/36)*rng, maj=i%4===0;
     const rO=172, len=maj?18:8;
@@ -415,7 +415,7 @@ function drawSpeedLimitArc(ctx) {
   ctx.clearRect(0,0,360,360);
   const lim = state.speedLimit;
   if (lim <= 0) return;
-  const sa = -PI * 0.75, arcR = PI * 1.5;
+  const sa = PI * 0.75, arcR = PI * 1.5;
   const tol = lim < 100 ? 5 : Math.round(lim * 0.05);
   const limHigh = lim + tol;
   const limClamped  = Math.min(lim,    180);
@@ -434,7 +434,7 @@ function drawSpeedLimitArc(ctx) {
 /* ── Arc de vitesse ── */
 function drawSpeedArc(ctx, speed) {
   ctx.clearRect(0,0,360,360);
-  const sa=-PI*0.75, ea=PI*0.75, arcR=ea-sa;
+  const sa=PI*0.75, ea=PI*2.25, arcR=ea-sa;
   const swA=sa+(Math.min(speed,180)/180)*arcR;
   const col = speedStateColor(speed);
 
