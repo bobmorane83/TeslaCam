@@ -1190,8 +1190,9 @@ static void updateDashboard(void) {
 
     /* Brake light halo (solid red at bottom) */
     if (arcBrake) {
-        /* Timeout: if no 0x118 for 400ms, treat brake as OFF */
-        bool brakeActive = canData.brakeLightOn && (now - lastBrakePedalMsg < 400);
+        /* Hold timer 600ms: évite le clignotement si status=0 bref entre deux status=1 */
+        bool brakeActive = canData.brakeLightOn && (now - lastBrakePedalMsg < 600);
+        if (!brakeActive) canData.brakeLightOn = false; // reset state une fois expiré
         if (brakeActive) {
             if (!brakeVisible) {
                 brakeVisible = true;
@@ -1481,8 +1482,11 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
         if (m->dlc >= 1) {
             /* VCLEFT_brakeLightStatus: bit 0, 2 bits — 0=OFF, 1=ON, 2=FAULT, 3=SNA */
             uint8_t status = m->data[0] & 0x03;
-            canData.brakeLightOn = (status == 1);
-            lastBrakePedalMsg = millis();
+            if (status == 1) {
+                canData.brakeLightOn = true;
+                lastBrakePedalMsg = millis();  // ne rafraîchir que sur ON (évite clignotement)
+            }
+            /* OFF/FAULT/SNA : laisser le hold timer gérer l'extinction */
         }
         break;
 
