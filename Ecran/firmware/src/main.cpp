@@ -523,7 +523,9 @@ static void createDashboard(void) {
 
     /* ── Speed limit tolerance arc (F2) — created BEFORE arcSpeed to be drawn underneath ── */
     arcSpeedLimit = lv_arc_create(scr);
-    lv_obj_set_size(arcSpeedLimit, SPEED_R_OUTER * 2, SPEED_R_OUTER * 2);
+    /* Centré sur le milieu de arcSpeed (r=155), dépasse de 4px de chaque côté : size=324, width=14 */
+    lv_obj_set_size(arcSpeedLimit, (SPEED_R_OUTER - SPEED_ARC_WIDTH/2 + 7) * 2,
+                                   (SPEED_R_OUTER - SPEED_ARC_WIDTH/2 + 7) * 2);
     lv_obj_center(arcSpeedLimit);
     lv_arc_set_rotation(arcSpeedLimit, 0);
     lv_arc_set_range(arcSpeedLimit, 0, 1);
@@ -534,7 +536,7 @@ static void createDashboard(void) {
     lv_obj_remove_style(arcSpeedLimit, NULL, LV_PART_KNOB);
     /* Background = red tolerance zone */
     lv_obj_set_style_arc_color(arcSpeedLimit, COL_RED, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(arcSpeedLimit, 10, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(arcSpeedLimit, 14, LV_PART_MAIN);
     lv_obj_set_style_arc_opa(arcSpeedLimit, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_arc_rounded(arcSpeedLimit, true, LV_PART_MAIN);
     /* Indicator hidden */
@@ -1190,9 +1192,8 @@ static void updateDashboard(void) {
 
     /* Brake light halo (solid red at bottom) */
     if (arcBrake) {
-        /* Hold timer 600ms: évite le clignotement si status=0 bref entre deux status=1 */
-        bool brakeActive = canData.brakeLightOn && (now - lastBrakePedalMsg < 600);
-        if (!brakeActive) canData.brakeLightOn = false; // reset state une fois expiré
+        /* Hold timer 600ms, check timestamp only (plus robuste que le bool) */
+        bool brakeActive = (now - lastBrakePedalMsg < 600);
         if (brakeActive) {
             if (!brakeVisible) {
                 brakeVisible = true;
