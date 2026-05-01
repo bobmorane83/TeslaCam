@@ -215,7 +215,7 @@ static const lv_color_t COL_BLUE     = MKCOL(26, 143, 255);
 static const lv_color_t COL_ORANGE   = MKCOL(255, 165, 0);   // orange standard CSS (clairement distinct du rouge)
 static const lv_color_t COL_WHITE    = MKCOL(255, 255, 255);
 static const lv_color_t COL_TEXTDIM  = MKCOL(58, 90, 112);
-static const lv_color_t COL_GREEN    = MKCOL(0, 255, 0);
+static const lv_color_t COL_GREEN    = MKCOL(0, 221, 85);
 
 static const lv_color_t COL_GREY     = MKCOL(80, 80, 80);
 
