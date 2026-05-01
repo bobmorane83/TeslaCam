@@ -8,7 +8,7 @@
 <style>
   :root {
     --bg: #050a0f;
-    --accent-teal: #00dd55;
+    --accent-teal: #00e5c8;
     --accent-amber: #ffaa00;
     --accent-red: #ff3b3b;
     --accent-blue: #1a8fff;
@@ -89,27 +89,42 @@
   }
   .limit-badge.active { opacity: 1; }
 
-  /* ── GEAR SELECTOR ── */
-  .gear-row {
-    position:absolute;
-    top: 86px; left:50%; transform:translateX(-50%);
-    display:flex; gap:5px; z-index:20;
+  /* ── CLOCK / TOP AREA ── */
+  .clock-area {
+    position:absolute; top:56px; left:50%; transform:translateX(-50%);
+    display:flex; align-items:center; gap:10px; z-index:20;
   }
-  .gear-box {
-    width:30px; height:28px; border-radius:4px;
-    border:1px solid rgba(0,229,200,0.10);
+  .clock-temp {
+    font-family:'Orbitron',monospace; font-size:11px; font-weight:400;
+    color:rgba(255,255,255,0.55); letter-spacing:1px;
+  }
+  .clock-time {
+    font-family:'Orbitron',monospace; font-size:18px; font-weight:700;
+    color:rgba(255,255,255,0.90); letter-spacing:2px;
+    text-shadow:0 0 14px rgba(255,255,255,0.2);
+  }
+
+  /* ── GEAR BOX (single, bottom right) ── */
+  .gear-single {
+    position:absolute; bottom:62px; right:60px; z-index:20;
+    width:34px; height:34px; border-radius:5px;
+    border:1px solid rgba(0,229,200,0.35);
     background:rgba(4,14,22,0.85);
     display:flex; align-items:center; justify-content:center;
-    font-family:'Orbitron',monospace;
-    font-size:12px; font-weight:900;
-    color:rgba(0,229,200,0.18);
-    cursor:pointer; transition: all 0.18s ease;
-    backdrop-filter:blur(6px); user-select:none;
+    font-family:'Orbitron',monospace; font-size:16px; font-weight:900;
+    color:#00e5c8;
+    box-shadow:0 0 10px rgba(0,229,200,0.20);
+    cursor:pointer; user-select:none;
   }
-  .gear-box.active-D { background:rgba(0,221,85,0.09); border-color:#00dd55; color:#00dd55; box-shadow:0 0 10px rgba(0,221,85,0.25); }
-  .gear-box.active-R { background:rgba(255,59,59,0.09); border-color:var(--accent-red); color:var(--accent-red); }
-  .gear-box.active-N { background:rgba(255,170,0,0.07); border-color:var(--accent-amber); color:var(--accent-amber); }
-  .gear-box.active-P { background:rgba(26,143,255,0.09); border-color:var(--accent-blue); color:var(--accent-blue); }
+
+  /* ── STATUS DOTS ── */
+  .status-dots {
+    position:absolute; bottom:20px; left:50%; transform:translateX(-50%);
+    display:flex; gap:8px; z-index:20;
+  }
+  .status-dot {
+    width:6px; height:6px; border-radius:50%;
+  }
 
   /* ── SPEED CENTER ── */
   .center-block {
@@ -128,7 +143,7 @@
   .speed-unit {
     font-family:'Rajdhani',sans-serif;
     font-size:13px; font-weight:600; letter-spacing:8px;
-    color:#00dd55; text-transform:uppercase; margin-top:-2px;
+    color:#00e5c8; text-transform:uppercase; margin-top:-2px;
   }
 
   /* ── WIDGETS ── */
@@ -147,7 +162,7 @@
   .regen-wrap { position:absolute; bottom:50px; left:50%; transform:translateX(-50%); display:flex; flex-direction:column; align-items:center; gap:5px; z-index:10; }
   .regen-row { display:flex; align-items:center; gap:10px; }
   .regen-lbl { font-size:7px; letter-spacing:4px; color:var(--text-dim); text-transform:uppercase; }
-  .regen-kw { font-family:'Orbitron',monospace; font-size:10px; font-weight:700; color:#00dd55; min-width:40px; text-align:right; text-shadow:0 0 8px rgba(0,221,85,0.5); transition:color 0.3s; }
+  .regen-kw { font-family:'Orbitron',monospace; font-size:10px; font-weight:700; color:#00e5c8; min-width:40px; text-align:right; text-shadow:0 0 8px rgba(0,229,200,0.5); transition:color 0.3s; }
   .regen-kw.zero { color:var(--text-dim); text-shadow:none; }
   .regen-track { width:100px; height:3px; background:rgba(255,255,255,0.05); border-radius:2px; overflow:hidden; }
   .regen-fill { height:100%; width:0%; border-radius:2px; background:linear-gradient(to right, rgba(0,229,200,0.3), var(--accent-teal)); transition:width 0.12s ease; }
@@ -156,9 +171,9 @@
   .controls { display:flex; gap:9px; flex-wrap:wrap; justify-content:center; max-width:540px; }
   .ctrl { display:flex; flex-direction:column; align-items:center; gap:5px; background:rgba(0,229,200,0.025); border:1px solid rgba(0,229,200,0.07); border-radius:4px; padding:7px 12px; }
   .ctrl label { font-size:8px; letter-spacing:3px; color:var(--text-dim); text-transform:uppercase; }
-  .ctrl input[type=range] { -webkit-appearance:none; width:100px; height:2px; background:rgba(0,221,85,0.15); border-radius:1px; outline:none; cursor:pointer; }
-  .ctrl input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:11px; height:11px; border-radius:50%; background:#00dd55; box-shadow:0 0 8px rgba(0,221,85,0.6); }
-  .ctrl-val { font-family:'Orbitron',monospace; font-size:10px; color:#00dd55; }
+  .ctrl input[type=range] { -webkit-appearance:none; width:100px; height:2px; background:rgba(0,229,200,0.15); border-radius:1px; outline:none; cursor:pointer; }
+  .ctrl input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:11px; height:11px; border-radius:50%; background:#00e5c8; box-shadow:0 0 8px rgba(0,229,200,0.6); }
+  .ctrl-val { font-family:'Orbitron',monospace; font-size:10px; color:#00e5c8; }
 
   /* Toggles */
   .toggle-ctrl {
@@ -181,20 +196,20 @@
   .sim-btn {
     font-family:'Orbitron',monospace; font-size:11px; font-weight:700; letter-spacing:2px;
     padding:10px 28px; border-radius:4px;
-    background: rgba(0,221,85,0.08);
-    border: 1px solid rgba(0,221,85,0.4);
-    color: #00dd55;
+    background: rgba(0,229,200,0.08);
+    border: 1px solid rgba(0,229,200,0.40);
+    color: #00e5c8;
     cursor:pointer; transition:all 0.2s;
     text-transform:uppercase;
   }
-  .sim-btn:hover { background:rgba(0,221,85,0.14); box-shadow:0 0 16px rgba(0,221,85,0.25); }
+  .sim-btn:hover { background:rgba(0,229,200,0.14); box-shadow:0 0 16px rgba(0,229,200,0.25); }
   .sim-btn:disabled { opacity:0.4; cursor:not-allowed; }
   .sim-progress {
     width:200px; height:2px; background:rgba(0,229,200,0.1); border-radius:1px; overflow:hidden;
   }
   .sim-bar {
-    height:100%; width:0%; background:#00dd55;
-    box-shadow:0 0 8px rgba(0,221,85,0.6);
+    height:100%; width:0%; background:#00e5c8;
+    box-shadow:0 0 8px rgba(0,229,200,0.6);
     transition:width 0.05s linear;
   }
   .sim-status {
@@ -234,12 +249,21 @@
   <!-- Limit badge -->
   <div class="limit-badge" id="limitBadge">80</div>
 
-  <!-- Gear selector -->
-  <div class="gear-row">
-    <div class="gear-box" data-gear="P">P</div>
-    <div class="gear-box" data-gear="R">R</div>
-    <div class="gear-box" data-gear="N">N</div>
-    <div class="gear-box active-D" data-gear="D">D</div>
+  <!-- Horloge + températures haut écran -->
+  <div class="clock-area">
+    <div class="clock-temp" id="extTemp">8°</div>
+    <div class="clock-time" id="clockDisplay">--:--</div>
+    <div class="clock-temp">27°</div>
+  </div>
+
+  <!-- Gear selector (single box, bas droite) -->
+  <div class="gear-single" id="gearDisplay">D</div>
+
+  <!-- Status dots -->
+  <div class="status-dots">
+    <div class="status-dot" style="background:#ff3b3b"></div>
+    <div class="status-dot" style="background:#ff7700"></div>
+    <div class="status-dot" style="background:#1a8fff"></div>
   </div>
 
   <!-- Speed -->
@@ -254,10 +278,9 @@
     <div class="w-lbl">AUTO-<br>NOMIE</div>
   </div>
 
-  <!-- Temp right -->
   <div class="widget w-temp">
-    <div class="w-val" style="font-size:26px;color:#ffaa00">28</div>
-    <div class="w-unit" style="color:#ffaa00">°C</div>
+    <div class="w-val" style="font-size:26px;color:#ffffff">28</div>
+    <div class="w-unit" style="color:rgba(255,255,255,0.6)">°C</div>
     <div class="w-lbl">TEMP<br>BATT.</div>
   </div>
 
@@ -265,8 +288,8 @@
 
   <!-- SoC -->
   <div class="widget w-soc">
-    <div class="w-val" id="socVal" style="font-size:23px;color:#00dd55">84</div>
-    <div class="w-unit" style="color:#00dd55">%</div>
+    <div class="w-val" id="socVal" style="font-size:23px;color:#00e5c8">84</div>
+    <div class="w-unit" style="color:#00e5c8">%</div>
     <div class="w-lbl">BATTERIE</div>
   </div>
 
@@ -333,7 +356,7 @@ const COL = {
   blue:   '#1a8fff',
   orange: '#ffa500',
   red:    '#ff3b3b',
-  tealDim:'rgba(0,221,85,0.12)',
+  tealDim:'rgba(0,229,200,0.12)',
   bg:     '#050a0f',
 };
 
@@ -440,7 +463,7 @@ function drawSpeedArc(ctx, speed) {
 function drawBattArc(ctx, soc) {
   ctx.clearRect(0,0,360,360);
   const sa=(PI/180)*148, ea=(PI/180)*392, arcR=ea-sa;
-  const col = soc>50?'#00dd55':soc>20?'#ffaa00':'#ff3b3b';
+  const col = soc>50?'#00e5c8':soc>20?'#ffaa00':'#ff3b3b';
   const swA=sa+(soc/100)*arcR;
   ctx.beginPath(); ctx.arc(CX,CY,120,sa,ea);
   ctx.lineWidth=4; ctx.strokeStyle='rgba(255,255,255,0.04)'; ctx.lineCap='round'; ctx.stroke();
@@ -489,12 +512,10 @@ function render() {
   lb.classList.toggle('active', lim > 0);
 
   // Gear boxes
-  document.querySelectorAll('.gear-box').forEach(el => {
-    el.className = 'gear-box' + (el.dataset.gear===state.gear ? ' active-'+state.gear : '');
-  });
+  document.getElementById('gearDisplay').textContent = state.gear;
 
   // SoC
-  const sc = state.soc>50?'#00dd55':state.soc>20?'#ffaa00':'#ff3b3b';
+  const sc = state.soc>50?'#00e5c8':state.soc>20?'#ffaa00':'#ff3b3b';
   document.getElementById('socVal').style.cssText = `font-size:23px;color:${sc};text-shadow:0 0 14px ${sc}90`;
 }
 
@@ -568,6 +589,16 @@ function startSimulation() {
     }
   }, 16);
 }
+
+/* ── Horloge ── */
+function updateClock() {
+  const now = new Date();
+  const hh = String(now.getHours()).padStart(2,'0');
+  const mm = String(now.getMinutes()).padStart(2,'0');
+  document.getElementById('clockDisplay').textContent = hh + ':' + mm;
+}
+updateClock();
+setInterval(updateClock, 10000);
 
 /* ── Init ── */
 drawBezel(document.getElementById('bezelCanvas').getContext('2d'));
