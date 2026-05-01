@@ -171,7 +171,9 @@ static volatile struct {
     bool     tripActive;
     float    energyAtDest;       // kWh, negative = won't make it
     bool     energyAtDestValid;
-} canData = { 0, GEAR_P, 0, false, 0, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0, 0, 0, 0, 0, false, 0.0f, false, 0.0f, false, false, false, false, false, false, false, 0.0f, false };
+    bool     autopilotActive;    // F1: DAS_autopilotState ∈ {3,4,5}
+    uint8_t  fusedSpeedLimitKph; // F2: DAS_fusedSpeedLimit × 5, 0=unknown, 155=none (31*5)
+} canData = { 0, GEAR_P, 0, false, 0, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0, 0, 0, 0, 0, false, 0.0f, false, 0.0f, false, false, false, false, false, false, false, 0.0f, false, false, 0 };
 
 #define BRIDGE_TIMEOUT_MS 10000
 static volatile unsigned long lastBridgeMsg = 0;
@@ -210,6 +212,7 @@ static const lv_color_t COL_TEAL_VDIM= MKCOL(0, 42, 38);
 static const lv_color_t COL_AMBER    = MKCOL(255, 170, 0);
 static const lv_color_t COL_RED      = MKCOL(255, 59, 59);
 static const lv_color_t COL_BLUE     = MKCOL(26, 143, 255);
+static const lv_color_t COL_ORANGE   = MKCOL(255, 165, 0);   // orange standard CSS (clairement distinct du rouge)
 static const lv_color_t COL_WHITE    = MKCOL(255, 255, 255);
 static const lv_color_t COL_TEXTDIM  = MKCOL(58, 90, 112);
 static const lv_color_t COL_GREEN    = MKCOL(0, 255, 0);
@@ -218,12 +221,23 @@ static const lv_color_t COL_GREY     = MKCOL(80, 80, 80);
 
 /* Vivid halo colors (fully saturated for turn signal glow) */
 static const lv_color_t COL_HALO_GREEN = MKCOL(0, 255, 0);
-static const lv_color_t COL_HALO_AMBER = MKCOL(255, 210, 0);
+static const lv_color_t COL_HALO_AMBER = MKCOL(255, 120, 0);  // orange vif (ex-ambre)
 static const lv_color_t COL_HALO_RED   = MKCOL(255, 0, 0);
 
 static lv_color_t lvSpeedColor(int speed) {
-    (void)speed;
-    return COL_GREEN;
+    /* F3: couleur dynamique selon dépassement de limite.
+     * Priorité: overTolerance > overLimit > autopilot > défaut (arc=VERT, label=BLANC) */
+    bool hasLimit      = (canData.fusedSpeedLimitKph != 0 && canData.fusedSpeedLimitKph != 155);
+    if (hasLimit) {
+        float tolerance    = (canData.fusedSpeedLimitKph < 100)
+                             ? 5.0f
+                             : canData.fusedSpeedLimitKph * 0.05f;
+        int   limitHigh    = canData.fusedSpeedLimitKph + (int)tolerance;
+        if (speed > limitHigh)                     return COL_RED;
+        if (speed > canData.fusedSpeedLimitKph)    return COL_ORANGE;
+    }
+    if (canData.autopilotActive)                   return COL_BLUE;
+    return COL_GREEN;  // état par défaut : arc vert
 }
 
 static lv_color_t lvSocColor(uint8_t soc) {
@@ -242,6 +256,7 @@ static lv_color_t lvTempColor(float t) {
  *  LVGL DASHBOARD WIDGETS
  * ====================================================================== */
 /* Speed arc (outer, 270° sweep) */
+static lv_obj_t *arcSpeedLimit; // F2: red tolerance zone arc, drawn BELOW arcSpeed
 static lv_obj_t *arcSpeed;
 static lv_obj_t *arcSpeedTrack; // background ring (using a second arc for the dim track)
 
@@ -352,7 +367,9 @@ static void recolorCanvas(uint8_t *buf, lv_color_t col) {
 static lv_color_t *turnCanvasBufLeft  = NULL;
 static lv_color_t *turnCanvasBufRight = NULL;
 static lv_color_t *brakeCanvasBuf     = NULL;
+static lv_color_t *speedHaloCanvasBuf = NULL; // F4: overspeed halo (top, red)
 static lv_obj_t   *arcBrake           = NULL;
+static lv_obj_t   *arcSpeedHalo       = NULL; // F4
 static bool        brakeVisible        = false;
 static volatile unsigned long lastBrakePedalMsg = 0;
 static volatile unsigned long lastBlindSpotMsg  = 0;
@@ -365,9 +382,10 @@ static volatile unsigned long lastTripMsg       = 0;
 /* Pre-render the halo glow for one side into canvas buffer (TRUE_COLOR_ALPHA).
  * Buffer layout: [color_low, color_high, alpha] per pixel */
 static void prerenderTurnHalo(uint8_t *buf, int side) {
-    float centerDeg = (side == 0) ? 180.0f : (side == 1) ? 0.0f : 270.0f;
-    float halfSpan = TURN_ARC_SPAN / 2.0f;
-    float tipFade  = (float)TURN_TIP_FADE;
+    /* side: 0=left (180°), 1=right (0°), 2=bottom (270°), 3=top-F4 (90°, 180° span) */
+    float centerDeg = (side == 0) ? 180.0f : (side == 1) ? 0.0f : (side == 2) ? 270.0f : 90.0f;
+    float halfSpan  = (side == 3) ? 90.0f : (TURN_ARC_SPAN / 2.0f);  // 180° total for top
+    float tipFade   = (float)TURN_TIP_FADE;
 
     for (int y = 0; y < SCREEN_H; y++) {
         for (int x = 0; x < SCREEN_W; x++) {
@@ -502,6 +520,29 @@ static void createDashboard(void) {
     lv_obj_center(tickCanvas);
     lv_obj_add_event_cb(tickCanvas, drawTicksCb, LV_EVENT_DRAW_MAIN_END, NULL);
     lv_obj_clear_flag(tickCanvas, LV_OBJ_FLAG_CLICKABLE);
+
+    /* ── Speed limit tolerance arc (F2) — created BEFORE arcSpeed to be drawn underneath ── */
+    arcSpeedLimit = lv_arc_create(scr);
+    lv_obj_set_size(arcSpeedLimit, SPEED_R_OUTER * 2, SPEED_R_OUTER * 2);
+    lv_obj_center(arcSpeedLimit);
+    lv_arc_set_rotation(arcSpeedLimit, 0);
+    lv_arc_set_range(arcSpeedLimit, 0, 1);
+    lv_arc_set_value(arcSpeedLimit, 0);
+    lv_arc_set_bg_angles(arcSpeedLimit, SPEED_ARC_START, SPEED_ARC_START); // hidden until limit known
+    lv_arc_set_mode(arcSpeedLimit, LV_ARC_MODE_NORMAL);
+    lv_obj_clear_flag(arcSpeedLimit, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_style(arcSpeedLimit, NULL, LV_PART_KNOB);
+    /* Background = red tolerance zone */
+    lv_obj_set_style_arc_color(arcSpeedLimit, COL_RED, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(arcSpeedLimit, 10, LV_PART_MAIN);
+    lv_obj_set_style_arc_opa(arcSpeedLimit, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(arcSpeedLimit, true, LV_PART_MAIN);
+    /* Indicator hidden */
+    lv_obj_set_style_arc_opa(arcSpeedLimit, LV_OPA_TRANSP, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(arcSpeedLimit, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(arcSpeedLimit, 0, 0);
+    lv_obj_set_style_pad_all(arcSpeedLimit, 0, 0);
+    lv_obj_add_flag(arcSpeedLimit, LV_OBJ_FLAG_HIDDEN); // masqué par défaut
 
     /* ── Speed arc ── */
     arcSpeed = lv_arc_create(scr);
@@ -770,6 +811,23 @@ static void createDashboard(void) {
         } else {
             Serial.println("[BRAKE] PSRAM alloc failed for brake halo canvas");
         }
+
+        /* F4: Overspeed halo (top, red, 180° arc) */
+        speedHaloCanvasBuf = (lv_color_t *)heap_caps_malloc(TURN_CANVAS_SIZE, MALLOC_CAP_SPIRAM);
+        if (speedHaloCanvasBuf) {
+            Serial.println("[SPEED_HALO] Pre-rendering overspeed halo canvas...");
+            prerenderTurnHalo((uint8_t *)speedHaloCanvasBuf, 3);  // top, 180° span
+            recolorCanvas((uint8_t *)speedHaloCanvasBuf, COL_HALO_RED);
+            Serial.println("[SPEED_HALO] Halo canvas ready");
+
+            arcSpeedHalo = lv_canvas_create(scr);
+            lv_canvas_set_buffer(arcSpeedHalo, speedHaloCanvasBuf, SCREEN_W, SCREEN_H, LV_IMG_CF_TRUE_COLOR_ALPHA);
+            lv_obj_center(arcSpeedHalo);
+            lv_obj_clear_flag(arcSpeedHalo, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_flag(arcSpeedHalo, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            Serial.println("[SPEED_HALO] PSRAM alloc failed");
+        }
     }
 #endif // FEATURE_TURN_SIGNAL
 
@@ -793,6 +851,35 @@ static void updateDashboard(void) {
     lv_arc_set_value(arcSpeed, noConnection ? 0 : speed);
     lv_color_t sCol = lvSpeedColor(speed);
     lv_obj_set_style_arc_color(arcSpeed, sCol, LV_PART_INDICATOR);
+    /* Label: BLANC par défaut (état normal), sinon même couleur que l'arc */
+    bool isDefaultSpeed = (sCol.full == COL_GREEN.full);
+    lv_obj_set_style_text_color(lblSpeed, noConnection ? COL_TEXTDIM : (isDefaultSpeed ? COL_WHITE : sCol), 0);
+
+    /* F2: Speed limit tolerance arc */
+    {
+        bool hasLimit = (!noConnection &&
+                         canData.fusedSpeedLimitKph != 0 &&
+                         canData.fusedSpeedLimitKph != 155);
+        if (hasLimit) {
+            float tolerance  = (canData.fusedSpeedLimitKph < 100)
+                               ? 5.0f
+                               : canData.fusedSpeedLimitKph * 0.05f;
+            int   limitHigh  = canData.fusedSpeedLimitKph + (int)tolerance;
+            /* Clamp to arc range */
+            int   limClamped  = canData.fusedSpeedLimitKph > 180 ? 180 : canData.fusedSpeedLimitKph;
+            int   highClamped = limitHigh > 180 ? 180 : limitHigh;
+            /* +/- 1.5° (≈ 4px at radius 158) de chaque côté */
+            float extend = 1.5f;
+            float fStart = SPEED_ARC_START + (limClamped  / 180.0f) * SPEED_ARC_RANGE - extend;
+            float fEnd   = SPEED_ARC_START + (highClamped / 180.0f) * SPEED_ARC_RANGE + extend;
+            uint16_t startAngle = (uint16_t)((int)fStart % 360 + 360) % 360;
+            uint16_t endAngle   = (uint16_t)((int)fEnd   % 360 + 360) % 360;
+            lv_arc_set_bg_angles(arcSpeedLimit, startAngle, endAngle);
+            lv_obj_clear_flag(arcSpeedLimit, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(arcSpeedLimit, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 
     /* Battery arc */
     lv_arc_set_value(arcBatt, noConnection ? 0 : soc);
@@ -1119,6 +1206,26 @@ static void updateDashboard(void) {
             }
         }
     }
+    /* F4: Overspeed halo (top, red) — visible when speed > fusedSpeedLimit + tolerance */
+    if (arcSpeedHalo) {
+        bool hasLimit       = (!noConnection &&
+                               canData.fusedSpeedLimitKph != 0 &&
+                               canData.fusedSpeedLimitKph != 155);
+        bool overTolerance  = false;
+        if (hasLimit) {
+            float tol      = (canData.fusedSpeedLimitKph < 100)
+                             ? 5.0f
+                             : canData.fusedSpeedLimitKph * 0.05f;
+            overTolerance  = ((int)canData.uiSpeed > canData.fusedSpeedLimitKph + (int)tol);
+        }
+        if (overTolerance) {
+            lv_obj_clear_flag(arcSpeedHalo, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_img_opa(arcSpeedHalo, LV_OPA_COVER, 0);
+            lv_obj_invalidate(arcSpeedHalo);
+        } else {
+            lv_obj_add_flag(arcSpeedHalo, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 #endif // FEATURE_TURN_SIGNAL
 }
 
@@ -1380,8 +1487,24 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
         break;
 
     case CAN_ID_BLIND_SPOT:
-        if (m->dlc >= 1) {
+        if (m->dlc >= 2) {
+            /* DAS_autopilotState: bits [3:0] of byte 0 — 3=ACTIVE_NOMINAL, 4=ACTIVE_RESTRICTED, 5=ACTIVE_NAV */
+            uint8_t apState = m->data[0] & 0x0F;
+            canData.autopilotActive = (apState == 3 || apState == 4 || apState == 5);
+
             /* DAS_blindSpotRearLeft: bit 4, 2 bits — 0=NO_WARNING, 1=LEVEL_1, 2=LEVEL_2, 3=SNA */
+            uint8_t bsLeft  = (m->data[0] >> 4) & 0x03;
+            uint8_t bsRight = (m->data[0] >> 6) & 0x03;
+            canData.blindSpotLeft  = (bsLeft == 1 || bsLeft == 2);
+            canData.blindSpotRight = (bsRight == 1 || bsRight == 2);
+
+            /* DAS_fusedSpeedLimit: bits [4:0] of byte 1, factor 5 → kph. 31(×5=155)=NONE, 0=UNKNOWN */
+            uint8_t rawLimit = m->data[1] & 0x1F;
+            canData.fusedSpeedLimitKph = rawLimit * 5;
+
+            lastBlindSpotMsg = millis();
+        } else if (m->dlc >= 1) {
+            /* Fallback: au moins les angles morts si DLC=1 */
             uint8_t bsLeft  = (m->data[0] >> 4) & 0x03;
             uint8_t bsRight = (m->data[0] >> 6) & 0x03;
             canData.blindSpotLeft  = (bsLeft == 1 || bsLeft == 2);
