@@ -53,7 +53,7 @@
     position:absolute; inset:0; border-radius:50%;
     background: radial-gradient(ellipse 170px 90px at 50% 0%,
       rgba(255,0,0,0.55) 0%,
-      rgba(255,0,0,0.20) 40%,
+      rgba(255,0,0,0.22) 40%,
       transparent 70%);
     pointer-events:none;
     opacity: 0;
@@ -463,7 +463,7 @@ function drawSpeedArc(ctx, speed) {
 function drawBattArc(ctx, soc) {
   ctx.clearRect(0,0,360,360);
   const sa=(PI/180)*148, ea=(PI/180)*392, arcR=ea-sa;
-  const col = soc>50?'#00e5c8':soc>20?'#ffaa00':'#ff3b3b';
+  const col = soc>20?'#00dd55':'#ffaa00';
   const swA=sa+(soc/100)*arcR;
   ctx.beginPath(); ctx.arc(CX,CY,120,sa,ea);
   ctx.lineWidth=4; ctx.strokeStyle='rgba(255,255,255,0.04)'; ctx.lineCap='round'; ctx.stroke();
@@ -515,8 +515,10 @@ function render() {
   document.getElementById('gearDisplay').textContent = state.gear;
 
   // SoC
-  const sc = state.soc>50?'#00e5c8':state.soc>20?'#ffaa00':'#ff3b3b';
-  document.getElementById('socVal').style.cssText = `font-size:23px;color:${sc};text-shadow:0 0 14px ${sc}90`;
+  const sc = state.soc>20?'#00dd55':'#ffaa00';
+  const socEl = document.getElementById('socVal');
+  socEl.textContent = state.soc;
+  socEl.style.cssText = `font-size:23px;color:${sc};text-shadow:0 0 14px ${sc}90`;
 }
 
 /* ── Bindings sliders ── */
